@@ -1,32 +1,32 @@
 import os
 import json
+import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from telegram import Bot
 
-# =========================
-# ENV
-# =========================
+# ============== LOGGING ==============
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("obsidian")
+
+# ============== ENV ==============
 BOT_NAME = os.getenv("BOT_NAME", "🜂 OBSIDIAN GOLD PRIME")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # مهم للحماية
-
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-# =========================
-# DATA
-# =========================
+# ============== DATA ==============
 @dataclass
 class Trade:
     trade_id: str
     asset: str
     exchange: str
-    direction: str  # BUY / SELL
+    direction: str
     entry: float
     sl: float
     tp1: float
@@ -35,7 +35,7 @@ class Trade:
     bias_15m: str
     confidence: int
     session: str
-    status: str  # ACTIVE / WIN / LOSS
+    status: str
     opened_at_utc: str
 
 @dataclass
@@ -50,18 +50,20 @@ class State:
     active_trade: Optional[Trade]
     perf: Performance
 
-# =========================
-# IO
-# =========================
+# ============== IO ==============
 def load_state() -> State:
     if not os.path.exists(STATE_FILE):
         return State(active_trade=None, perf=Performance())
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    t = raw.get("active_trade")
-    trade = Trade(**t) if t else None
-    perf = Performance(**raw.get("perf", {}))
-    return State(active_trade=trade, perf=perf)
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        t = raw.get("active_trade")
+        trade = Trade(**t) if t else None
+        perf = Performance(**raw.get("perf", {}))
+        return State(active_trade=trade, perf=perf)
+    except Exception as e:
+        log.warning("State file invalid, resetting. err=%s", e)
+        return State(active_trade=None, perf=Performance())
 
 def save_state(state: State) -> None:
     raw = {
@@ -73,11 +75,10 @@ def save_state(state: State) -> None:
         json.dump(raw, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
 
-# =========================
-# TELEGRAM
-# =========================
+# ============== TELEGRAM ==============
 def tg_send(text: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.info("Telegram not configured; skipping send.")
         return
     Bot(token=TELEGRAM_TOKEN).send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
@@ -115,16 +116,14 @@ def format_update(trade: Trade, result: str) -> str:
         f"Trade ID: {trade.trade_id}\n"
     )
 
-# =========================
-# WEBHOOK SCHEMA
-# =========================
+# ============== WEBHOOK SCHEMA ==============
 class TVPayload(BaseModel):
     secret: str
-    event: str          # "ENTRY" or "RESOLVE"
+    event: str
     trade_id: str
-    asset: str          # "XAUUSD"
-    exchange: str       # "OANDA"
-    direction: str      # "BUY"/"SELL"
+    asset: str
+    exchange: str
+    direction: str
     entry: float
     sl: float
     tp1: float
@@ -132,11 +131,16 @@ class TVPayload(BaseModel):
     tp3: float
     bias_15m: str
     confidence: int
-    session: str        # "ALL" (انت طلبت كل الجلسات)
-    result: Optional[str] = None  # "WIN"/"LOSS" عند RESOLVE فقط
+    session: str
+    result: Optional[str] = None
 
 app = FastAPI()
 STATE = load_state()
+log.info("BOOT: %s | state_loaded=%s", BOT_NAME, "yes")
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "obsidian-gold-prime"}
 
 @app.get("/health")
 def health():
@@ -146,14 +150,13 @@ def health():
 async def tv_webhook(payload: TVPayload, request: Request):
     global STATE
 
-    # حماية
     if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # ENTRY
-    if payload.event == "ENTRY":
+    event = payload.event.upper().strip()
+
+    if event == "ENTRY":
         if STATE.active_trade is not None:
-            # صفقة واحدة فقط
             return {"ok": True, "ignored": True, "reason": "active_trade_exists"}
 
         trade = Trade(
@@ -177,8 +180,7 @@ async def tv_webhook(payload: TVPayload, request: Request):
         tg_send(format_signal(trade))
         return {"ok": True, "status": "active_set"}
 
-    # RESOLVE
-    if payload.event == "RESOLVE":
+    if event == "RESOLVE":
         if STATE.active_trade is None:
             return {"ok": True, "ignored": True, "reason": "no_active_trade"}
 
@@ -189,7 +191,6 @@ async def tv_webhook(payload: TVPayload, request: Request):
         if result not in ("WIN", "LOSS"):
             raise HTTPException(status_code=400, detail="Invalid result")
 
-        # تحديث الأداء
         STATE.perf.trades += 1
         if result == "WIN":
             STATE.perf.wins += 1
@@ -202,7 +203,6 @@ async def tv_webhook(payload: TVPayload, request: Request):
         trade.status = result
         tg_send(format_update(trade, result))
 
-        # إغلاق الصفقة
         STATE.active_trade = None
         save_state(STATE)
         return {"ok": True, "closed": True}
