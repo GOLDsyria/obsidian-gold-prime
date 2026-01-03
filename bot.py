@@ -169,6 +169,33 @@ async def admin_reset(payload: AdminSecret):
     save_state()
     sent = await tg_send(f"{BOT_NAME}\n♻️ State reset done.\n{utc_now_iso()}")
     return {"ok": True, "telegram": "sent" if sent else "not_configured"}
+    def normalize_tv_payload(raw: dict) -> dict:
+    """
+    Accept both long keys and short aliases from Pine Script.
+    Converts aliases to canonical keys expected by TVPayload / business logic.
+    """
+    alias_map = {
+        "s": "secret",
+        "e": "event",
+        "id": "trade_id",
+        "a": "asset",
+        "x": "exchange",
+        "d": "direction",
+        "en": "entry",
+        "t1": "tp1",
+        "t2": "tp2",
+        "t3": "tp3",
+        "b": "bias_15m",
+        "c": "confidence",
+        "se": "session",
+        "r": "result",
+    }
+    out = dict(raw)
+    for k, v in list(raw.items()):
+        if k in alias_map and alias_map[k] not in out:
+            out[alias_map[k]] = v
+    return out
+
 
 @app.post("/tv")
 async def tv_webhook(request: Request):
