@@ -1,36 +1,35 @@
 import os
 import json
-import time
+import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict
 
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
-from telegram import Bot
+import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, ConfigDict
 
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("obsidian")
 
 # =========================
 # ENV
 # =========================
 BOT_NAME = os.getenv("BOT_NAME", "🜂 OBSIDIAN GOLD PRIME")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "ChangeMe")
 
-# Optional controls
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "0"))  # set to 70 مثلا لو بدك فلترة
-ALLOW_ASSETS = os.getenv("ALLOW_ASSETS", "")            # "XAUUSD,XAGUSD,BTCUSDT" أو اتركه فارغ = الكل
-RISK_PCT = float(os.getenv("RISK_PCT", "0.25"))         # 0.25% default
-ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "0"))  # لو 0 => لا يحسب حجم الصفقة
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# News blackout windows (UTC) as JSON list:
-# مثال:
-# [{"start":"2026-01-03T12:25:00Z","end":"2026-01-03T12:40:00Z","title":"NFP"}]
-NEWS_BLACKOUTS_JSON = os.getenv("NEWS_BLACKOUTS", "[]")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
+# مهم: على Koyeb بدون Volume قد يختفي state عند إعادة النشر
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-
 
 # =========================
 # DATA
@@ -40,7 +39,7 @@ class Trade:
     trade_id: str
     asset: str
     exchange: str
-    direction: str  # BUY/SELL
+    direction: str  # BUY / SELL
     entry: float
     sl: float
     tp1: float
@@ -49,13 +48,8 @@ class Trade:
     bias_15m: str
     confidence: int
     session: str
-    status: str  # ACTIVE/WIN/LOSS
+    status: str  # ACTIVE / WIN / LOSS
     opened_at_utc: str
-
-    # optional derived
-    risk_usd: float = 0.0
-    rr_to_tp1: float = 0.0
-    position_size_units: float = 0.0  # تقديري (units) إن توفر حساب
 
 @dataclass
 class Performance:
@@ -69,387 +63,250 @@ class State:
     # صفقة واحدة لكل أصل
     active_trades: Dict[str, Trade]
     perf: Performance
-    last_update_utc: str = ""
-
-
-# =========================
-# UTILS
-# =========================
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def _parse_iso_z(s: str) -> datetime:
-    # يقبل ...Z
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
-
-def load_blackouts() -> List[dict]:
-    try:
-        data = json.loads(NEWS_BLACKOUTS_JSON or "[]")
-        if isinstance(data, list):
-            return data
-    except Exception:
-        pass
-    return []
-
-def in_blackout(now: datetime, blackouts: List[dict]) -> Tuple[bool, str]:
-    for b in blackouts:
-        try:
-            start = _parse_iso_z(b["start"])
-            end = _parse_iso_z(b["end"])
-            title = b.get("title", "NEWS")
-            if start <= now <= end:
-                return True, title
-        except Exception:
-            continue
-    return False, ""
-
 
 # =========================
 # IO
 # =========================
+def _safe_load_json(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.error("STATE load failed: %s", e)
+        return {}
+
 def load_state() -> State:
-    if not os.path.exists(STATE_FILE):
-        return State(active_trades={}, perf=Performance(), last_update_utc=_now_utc_iso())
-
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    active_raw = raw.get("active_trades", {}) or {}
+    raw = _safe_load_json(STATE_FILE)
+    at = raw.get("active_trades", {}) or {}
     active_trades: Dict[str, Trade] = {}
-    for k, v in active_raw.items():
+    for k, v in at.items():
         try:
             active_trades[k] = Trade(**v)
         except Exception:
             continue
-
     perf = Performance(**(raw.get("perf", {}) or {}))
-    last_update_utc = raw.get("last_update_utc", _now_utc_iso())
-    return State(active_trades=active_trades, perf=perf, last_update_utc=last_update_utc)
+    return State(active_trades=active_trades, perf=perf)
 
 def save_state(state: State) -> None:
     raw = {
         "active_trades": {k: asdict(v) for k, v in state.active_trades.items()},
         "perf": asdict(state.perf),
-        "last_update_utc": state.last_update_utc or _now_utc_iso(),
     }
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
 
-
 # =========================
-# TELEGRAM
+# TELEGRAM (HTTP API)
 # =========================
-def tg_send(text: str) -> None:
+def tg_send(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        log.warning("Telegram not configured (missing TELEGRAM_TOKEN/TELEGRAM_CHAT_ID).")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
     try:
-        Bot(token=TELEGRAM_TOKEN).send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            log.error("Telegram send failed: %s | %s", r.status_code, r.text[:300])
+            return False
+        return True
     except Exception as e:
-        # ما نوقف السيرفر بسبب تيليجرام
-        print(f"[TG_ERR] {e}")
-
-def calc_risk_and_size(entry: float, sl: float) -> Tuple[float, float]:
-    """
-    حساب تقديري:
-    risk_usd = balance * (RISK_PCT / 100)
-    size_units = risk_usd / abs(entry - sl)
-    هذا مناسب كـ "unit sizing" عام. للفوركس/ذهب الحقيقي تحتاج pipValue/contract.
-    """
-    if ACCOUNT_BALANCE <= 0 or RISK_PCT <= 0:
-        return 0.0, 0.0
-    dist = abs(entry - sl)
-    if dist <= 0:
-        return 0.0, 0.0
-    risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
-    size_units = risk_usd / dist
-    return float(risk_usd), float(size_units)
-
-def rr(entry: float, sl: float, tp: float) -> float:
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return 0.0
-    reward = abs(tp - entry)
-    return round(reward / risk, 2)
+        log.error("Telegram send exception: %s", e)
+        return False
 
 def format_signal(trade: Trade) -> str:
-    size_line = ""
-    if trade.risk_usd > 0 and trade.position_size_units > 0:
-        size_line = f"\nRisk: ${trade.risk_usd:.2f} | Size(units): {trade.position_size_units:.4f}"
-
     return (
         f"{BOT_NAME}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 SMC / ICT / SK ENTRY\n\n"
+        "Institutional Scalping Signal\n\n"
         f"Asset: {trade.asset}\n"
         f"Exchange: {trade.exchange}\n"
         f"Direction: {trade.direction}\n"
-        f"Confidence: {trade.confidence}/100\n"
-        f"Session: {trade.session}\n"
-        f"Bias(15m): {trade.bias_15m}\n"
-        f"{size_line}\n\n"
-        f"Entry: {trade.entry:.4f}\n"
-        f"SL:    {trade.sl:.4f}\n"
-        f"TP1:   {trade.tp1:.4f}  | RR≈ {trade.rr_to_tp1}\n"
-        f"TP2:   {trade.tp2:.4f}\n"
-        f"TP3:   {trade.tp3:.4f}\n\n"
+        f"Confidence: {trade.confidence} / 100\n"
+        f"Session: {trade.session}\n\n"
+        f"Entry: {trade.entry:.2f}\n"
+        f"SL: {trade.sl:.2f}\n"
+        f"TP1: {trade.tp1:.2f}\n"
+        f"TP2: {trade.tp2:.2f}\n"
+        f"TP3: {trade.tp3:.2f}\n\n"
+        f"HTF Bias (15M): {trade.bias_15m}\n"
         f"Trade ID: {trade.trade_id}\n"
-        f"Status: ACTIVE"
+        "Status: ACTIVE ✅"
     )
 
 def format_update(trade: Trade, result: str) -> str:
-    icon = "✅" if result == "WIN" else "❌"
-    hype = "🔥 هدف تحقق! استمر بإدارة المخاطر." if result == "WIN" else "🧊 وقف ضرب. لا تطارد السوق."
+    emoji = "🏆" if result == "WIN" else "🛑"
     return (
         f"{BOT_NAME}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{icon} TRADE CLOSED\n\n"
+        f"Trade Update {emoji}\n\n"
         f"Asset: {trade.asset}\n"
         f"Direction: {trade.direction}\n"
         f"Result: {result}\n"
-        f"{hype}\n\n"
-        f"Entry: {trade.entry:.4f} | SL: {trade.sl:.4f} | TP1: {trade.tp1:.4f}\n"
+        f"Entry: {trade.entry:.2f} | SL: {trade.sl:.2f} | TP1: {trade.tp1:.2f}\n"
         f"Trade ID: {trade.trade_id}"
     )
 
+# =========================
+# WEBHOOK SCHEMA (يدعم مفاتيح قصيرة لتفادي حد 300/JSON)
+# long keys: secret,event,trade_id,asset,exchange,direction,entry,sl,tp1,tp2,tp3,bias_15m,confidence,session,result
+# short keys: s,e,id,a,x,d,en,sl,t1,t2,t3,b,c,se,r
+# =========================
+class TVPayload(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    secret: str = Field(alias="s")
+    event: str = Field(alias="e")          # ENTRY / RESOLVE
+    trade_id: str = Field(alias="id")
+
+    asset: str = Field(alias="a")
+    exchange: str = Field(alias="x")
+    direction: str = Field(alias="d")      # BUY / SELL
+
+    entry: float = Field(alias="en")
+    sl: float = Field(alias="sl")
+    tp1: float = Field(alias="t1")
+    tp2: float = Field(alias="t2")
+    tp3: float = Field(alias="t3")
+
+    bias_15m: str = Field(alias="b")
+    confidence: int = Field(alias="c")
+    session: str = Field(alias="se")
+    result: Optional[str] = Field(default=None, alias="r")
 
 # =========================
-# WEBHOOK INPUT
+# ADMIN SCHEMAS
 # =========================
-class TVPayloadLong(BaseModel):
+class AdminSecret(BaseModel):
     secret: str
-    event: str
-    trade_id: str
-    asset: str
-    exchange: str
-    direction: str
-    entry: float
-    sl: float
-    tp1: float
-    tp2: float
-    tp3: float
-    bias_15m: str
-    confidence: int
-    session: str
-    result: Optional[str] = None
 
-# نسخة مفاتيح قصيرة لتجاوز حد 300 حرف في TradingView
-# s=secret, e=event, id=trade_id, a=asset, x=exchange, d=direction
-# en=entry, sl=sl, t1/t2/t3, b=bias_15m, c=confidence, se=session, r=result
-class TVPayloadShort(BaseModel):
-    s: str = Field(..., alias="s")
-    e: str = Field(..., alias="e")
-    id: str = Field(..., alias="id")
-    a: str = Field(..., alias="a")
-    x: str = Field(..., alias="x")
-    d: str = Field(..., alias="d")
-    en: float = Field(..., alias="en")
-    sl: float = Field(..., alias="sl")
-    t1: float = Field(..., alias="t1")
-    t2: float = Field(..., alias="t2")
-    t3: float = Field(..., alias="t3")
-    b: str = Field(..., alias="b")
-    c: int = Field(..., alias="c")
-    se: str = Field(..., alias="se")
-    r: Optional[str] = Field(default=None, alias="r")
+class AdminNotify(BaseModel):
+    secret: str
+    text: str
 
-
-app = FastAPI(title="OBSIDIAN GOLD PRIME")
+# =========================
+# APP
+# =========================
+app = FastAPI()
 STATE = load_state()
-BLACKOUTS = load_blackouts()
+log.info(
+    "BOOT OK | bot=%s | state_loaded=yes | active_assets=%s",
+    BOT_NAME,
+    len(STATE.active_trades),
+)
 
-def asset_allowed(asset: str) -> bool:
-    if not ALLOW_ASSETS.strip():
-        return True
-    allowed = {x.strip().upper() for x in ALLOW_ASSETS.split(",") if x.strip()}
-    return asset.upper() in allowed
-
+@app.get("/")
+def root():
+    return {"ok": True, "service": "obsidian-gold-prime", "bot": BOT_NAME}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "bot": BOT_NAME, "active_assets": len(STATE.active_trades)}
+    return {"ok": True, "bot": BOT_NAME}
 
 @app.get("/state")
 def state_view():
-    # عرض مبسط
     return {
         "ok": True,
         "active_trades": {k: asdict(v) for k, v in STATE.active_trades.items()},
         "perf": asdict(STATE.perf),
-        "blackouts": BLACKOUTS,
-        "last_update_utc": STATE.last_update_utc,
     }
 
-class AdminSecret(BaseModel):
-    secret: str
-
-class AdminNotify(AdminSecret):
-    text: str
-
-@app.post("/admin/ping")
-def admin_ping(body: AdminSecret):
-    if body.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    tg_send("✅ Telegram connected successfully.")
-    return {"ok": True, "telegram": "sent"}
-
-@app.post("/admin/notify")
-def admin_notify(body: AdminNotify):
-    if body.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    tg_send(body.text)
-    return {"ok": True, "telegram": "sent"}
-
-@app.post("/admin/reset")
-def admin_reset(body: AdminSecret):
-    global STATE
-    if body.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    STATE = State(active_trades={}, perf=Performance(), last_update_utc=_now_utc_iso())
-    save_state(STATE)
-    tg_send("♻️ State reset: cleared all active trades.")
-    return {"ok": True, "reset": True}
-
-class AdminBlackouts(AdminSecret):
-    blackouts: List[dict]
-
-@app.post("/admin/blackouts")
-def admin_blackouts(body: AdminBlackouts):
-    global BLACKOUTS
-    if body.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    BLACKOUTS = body.blackouts
-    tg_send(f"🧯 Updated blackouts: {len(BLACKOUTS)} window(s).")
-    return {"ok": True, "count": len(BLACKOUTS)}
-
-@app.post("/tv")
-async def tv_webhook(request: Request):
-    """
-    يقبل payload طويل أو قصير
-    """
-    global STATE
-
-    payload = await request.json()
-
-    # حاول قصير أولاً
-    is_short = "s" in payload and "e" in payload and "id" in payload
-    if is_short:
-        p = TVPayloadShort(**payload)
-        secret = p.s
-        event = p.e
-        trade_id = p.id
-        asset = p.a
-        exchange = p.x
-        direction = p.d
-        entry = p.en
-        sl = p.sl
-        tp1, tp2, tp3 = p.t1, p.t2, p.t3
-        bias_15m = p.b
-        confidence = int(p.c)
-        session = p.se
-        result = p.r
-    else:
-        p = TVPayloadLong(**payload)
-        secret = p.secret
-        event = p.event
-        trade_id = p.trade_id
-        asset = p.asset
-        exchange = p.exchange
-        direction = p.direction
-        entry = p.entry
-        sl = p.sl
-        tp1, tp2, tp3 = p.tp1, p.tp2, p.tp3
-        bias_15m = p.bias_15m
-        confidence = int(p.confidence)
-        session = p.session
-        result = p.result
-
-    # حماية secret
+def _auth_or_401(secret: str):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    asset_u = asset.upper()
+@app.post("/admin/ping")
+def admin_ping(payload: AdminSecret):
+    _auth_or_401(payload.secret)
+    sent = tg_send(f"{BOT_NAME}\n✅ Telegram OK (admin/ping)")
+    return {"ok": True, "telegram": "sent" if sent else "failed"}
 
-    # فلترة أصل
-    if not asset_allowed(asset_u):
-        return {"ok": True, "ignored": True, "reason": "asset_not_allowed"}
+@app.post("/admin/notify")
+def admin_notify(payload: AdminNotify):
+    _auth_or_401(payload.secret)
+    sent = tg_send(f"{BOT_NAME}\n{payload.text}")
+    return {"ok": True, "telegram": "sent" if sent else "failed"}
 
-    # فلترة ثقة
-    if confidence < MIN_CONFIDENCE:
-        return {"ok": True, "ignored": True, "reason": "low_confidence"}
+@app.post("/admin/reset")
+def admin_reset(payload: AdminSecret):
+    _auth_or_401(payload.secret)
+    STATE.active_trades = {}
+    STATE.perf = Performance()
+    save_state(STATE)
+    return {"ok": True, "reset": True}
 
-    # فلترة أخبار (UTC)
-    now = datetime.now(timezone.utc)
-    blocked, title = in_blackout(now, BLACKOUTS)
-    if blocked:
-        return {"ok": True, "ignored": True, "reason": f"news_blackout:{title}"}
+@app.post("/tv")
+def tv_webhook(payload: TVPayload):
+    _auth_or_401(payload.secret)
 
-    event_u = str(event).upper().strip()
+    event = payload.event.upper().strip()
+    asset_key = (payload.asset or "").upper().strip()
+
+    if not asset_key:
+        raise HTTPException(status_code=400, detail="Missing asset")
 
     # ENTRY
-    if event_u == "ENTRY":
-        if asset_u in STATE.active_trades:
-            return {"ok": True, "ignored": True, "reason": "active_trade_exists"}
+    if event == "ENTRY":
+        if asset_key in STATE.active_trades:
+            return {"ok": True, "ignored": True, "reason": "active_trade_exists_for_asset", "asset": asset_key}
 
-        risk_usd, size_units = calc_risk_and_size(entry, sl)
         trade = Trade(
-            trade_id=trade_id,
-            asset=asset_u,
-            exchange=exchange,
-            direction=direction.upper(),
-            entry=float(entry),
-            sl=float(sl),
-            tp1=float(tp1),
-            tp2=float(tp2),
-            tp3=float(tp3),
-            bias_15m=bias_15m,
-            confidence=int(confidence),
-            session=session,
+            trade_id=payload.trade_id,
+            asset=asset_key,
+            exchange=payload.exchange,
+            direction=payload.direction.upper(),
+            entry=float(payload.entry),
+            sl=float(payload.sl),
+            tp1=float(payload.tp1),
+            tp2=float(payload.tp2),
+            tp3=float(payload.tp3),
+            bias_15m=payload.bias_15m,
+            confidence=int(payload.confidence),
+            session=payload.session,
             status="ACTIVE",
-            opened_at_utc=_now_utc_iso(),
-            risk_usd=risk_usd,
-            rr_to_tp1=rr(entry, sl, tp1),
-            position_size_units=size_units,
+            opened_at_utc=datetime.now(timezone.utc).isoformat(),
         )
 
-        STATE.active_trades[asset_u] = trade
-        STATE.last_update_utc = _now_utc_iso()
+        STATE.active_trades[asset_key] = trade
         save_state(STATE)
         tg_send(format_signal(trade))
-        return {"ok": True, "active_set": True}
+        return {"ok": True, "status": "active_set", "asset": asset_key}
 
     # RESOLVE
-    if event_u == "RESOLVE":
-        if asset_u not in STATE.active_trades:
-            return {"ok": True, "ignored": True, "reason": "no_active_trade"}
+    if event == "RESOLVE":
+        trade = STATE.active_trades.get(asset_key)
+        if not trade:
+            return {"ok": True, "ignored": True, "reason": "no_active_trade_for_asset", "asset": asset_key}
 
-        active = STATE.active_trades[asset_u]
+        if payload.trade_id != trade.trade_id:
+            return {"ok": True, "ignored": True, "reason": "trade_id_mismatch", "asset": asset_key}
 
-        if trade_id != active.trade_id:
-            return {"ok": True, "ignored": True, "reason": "trade_id_mismatch"}
+        result = (payload.result or "").upper().strip()
+        if result not in ("WIN", "LOSS"):
+            raise HTTPException(status_code=400, detail="Invalid result (use WIN/LOSS)")
 
-        res = (result or "").upper()
-        if res not in ("WIN", "LOSS"):
-            raise HTTPException(status_code=400, detail="Invalid result")
-
-        # update perf
+        # تحديث الأداء (عام)
         STATE.perf.trades += 1
-        if res == "WIN":
+        if result == "WIN":
             STATE.perf.wins += 1
             STATE.perf.consec_losses = 0
         else:
             STATE.perf.losses += 1
             STATE.perf.consec_losses += 1
 
-        active.status = res
-        STATE.last_update_utc = _now_utc_iso()
-        tg_send(format_update(active, res))
+        trade.status = result
+        tg_send(format_update(trade, result))
 
-        del STATE.active_trades[asset_u]
+        # إغلاق الصفقة لهذا الأصل فقط
+        del STATE.active_trades[asset_key]
         save_state(STATE)
-        return {"ok": True, "closed": True}
+        return {"ok": True, "closed": True, "asset": asset_key}
 
-    raise HTTPException(status_code=400, detail="Unknown event")
+    raise HTTPException(status_code=400, detail="Unknown event (use ENTRY/RESOLVE)")
