@@ -3,30 +3,36 @@ import json
 import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict
 
-from fastapi import FastAPI, Request, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from telegram import Bot
 
-# ============== LOGGING ==============
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("obsidian")
 
-# ============== ENV ==============
-BOT_NAME = os.getenv("BOT_NAME", "🜂 OBSIDIAN GOLD PRIME")
+# =========================
+# ENV
+# =========================
+BOT_NAME = os.getenv("BOT_NAME", "🜂 OBSIDIAN PRIME")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # must match Pine secret
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-# ============== DATA ==============
+# =========================
+# DATA
+# =========================
 @dataclass
 class Trade:
     trade_id: str
-    asset: str
-    exchange: str
-    direction: str
+    asset: str          # e.g. XAUUSD / XAGUSD / EURUSD / BTCUSDT
+    exchange: str       # e.g. OANDA / BINANCE
+    direction: str      # BUY / SELL
     entry: float
     sl: float
     tp1: float
@@ -35,7 +41,7 @@ class Trade:
     bias_15m: str
     confidence: int
     session: str
-    status: str
+    status: str         # ACTIVE / WIN / LOSS
     opened_at_utc: str
 
 @dataclass
@@ -47,42 +53,69 @@ class Performance:
 
 @dataclass
 class State:
-    active_trade: Optional[Trade]
-    perf: Performance
+    # One active trade per asset
+    active_trades: Dict[str, Trade]
+    # Performance per asset
+    perf_by_asset: Dict[str, Performance]
 
-# ============== IO ==============
+# =========================
+# STATE IO
+# =========================
+def _default_state() -> State:
+    return State(active_trades={}, perf_by_asset={})
+
 def load_state() -> State:
     if not os.path.exists(STATE_FILE):
-        return State(active_trade=None, perf=Performance())
+        return _default_state()
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        t = raw.get("active_trade")
-        trade = Trade(**t) if t else None
-        perf = Performance(**raw.get("perf", {}))
-        return State(active_trade=trade, perf=perf)
+
+        active_trades_raw = raw.get("active_trades", {})
+        active_trades: Dict[str, Trade] = {}
+        for asset, t in active_trades_raw.items():
+            if t:
+                active_trades[asset] = Trade(**t)
+
+        perf_raw = raw.get("perf_by_asset", {})
+        perf_by_asset: Dict[str, Performance] = {}
+        for asset, p in perf_raw.items():
+            perf_by_asset[asset] = Performance(**p)
+
+        return State(active_trades=active_trades, perf_by_asset=perf_by_asset)
     except Exception as e:
-        log.warning("State file invalid, resetting. err=%s", e)
-        return State(active_trade=None, perf=Performance())
+        log.warning("State file invalid; resetting. err=%s", e)
+        return _default_state()
 
 def save_state(state: State) -> None:
     raw = {
-        "active_trade": asdict(state.active_trade) if state.active_trade else None,
-        "perf": asdict(state.perf),
+        "active_trades": {a: asdict(t) for a, t in state.active_trades.items()},
+        "perf_by_asset": {a: asdict(p) for a, p in state.perf_by_asset.items()},
     }
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
 
-# ============== TELEGRAM ==============
-def tg_send(text: str) -> None:
+# =========================
+# TELEGRAM (Stable HTTP API)
+# =========================
+async def tg_send(text: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.info("Telegram not configured; skipping send.")
+        log.warning("Telegram env vars missing; skipping send.")
         return
-    Bot(token=TELEGRAM_TOKEN).send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
-def format_signal(trade: Trade) -> str:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+    except Exception as e:
+        log.error("Telegram send failed: %s", e)
+
+def _fmt_signal(trade: Trade) -> str:
     return (
         f"{BOT_NAME}\n"
         "Institutional Scalping Signal\n\n"
@@ -105,7 +138,7 @@ def format_signal(trade: Trade) -> str:
         f"Trade ID: {trade.trade_id}\n"
     )
 
-def format_update(trade: Trade, result: str) -> str:
+def _fmt_update(trade: Trade, result: str) -> str:
     return (
         f"{BOT_NAME}\n"
         "Trade Update\n\n"
@@ -116,14 +149,16 @@ def format_update(trade: Trade, result: str) -> str:
         f"Trade ID: {trade.trade_id}\n"
     )
 
-# ============== WEBHOOK SCHEMA ==============
+# =========================
+# WEBHOOK SCHEMA
+# =========================
 class TVPayload(BaseModel):
     secret: str
-    event: str
+    event: str               # ENTRY or RESOLVE
     trade_id: str
-    asset: str
-    exchange: str
-    direction: str
+    asset: str               # XAUUSD / XAGUSD / EURUSD / BTCUSDT ...
+    exchange: str            # OANDA / BINANCE ...
+    direction: str           # BUY / SELL
     entry: float
     sl: float
     tp1: float
@@ -132,92 +167,130 @@ class TVPayload(BaseModel):
     bias_15m: str
     confidence: int
     session: str
-    result: Optional[str] = None
+    result: Optional[str] = None  # WIN / LOSS (only for RESOLVE)
 
+# =========================
+# APP
+# =========================
 app = FastAPI()
 STATE = load_state()
-log.info("BOOT: %s | state_loaded=%s", BOT_NAME, "yes")
+log.info("BOOT OK | bot=%s | state_loaded=yes | active_assets=%d", BOT_NAME, len(STATE.active_trades))
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "obsidian-gold-prime"}
+    return {"ok": True, "service": "obsidian-prime"}
 
 @app.get("/health")
 def health():
     return {"ok": True, "bot": BOT_NAME}
-    @app.post("/admin/ping")
-async def admin_ping(payload: dict):
-    if WEBHOOK_SECRET and payload.get("secret") != WEBHOOK_SECRET:
+
+def _require_secret(secret: str) -> None:
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    try:
-        Bot(token=TELEGRAM_TOKEN).send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=f"{BOT_NAME}\nTelegram test: OK ✅"
-        )
-        return {"ok": True, "telegram": "sent"}
-    except Exception as e:
-        return {"ok": False, "telegram_error": str(e)}
+def _get_perf(asset: str) -> Performance:
+    if asset not in STATE.perf_by_asset:
+        STATE.perf_by_asset[asset] = Performance()
+    return STATE.perf_by_asset[asset]
 
 @app.post("/tv")
-async def tv_webhook(payload: TVPayload, request: Request):
+async def tv_webhook(payload: TVPayload):
     global STATE
+    _require_secret(payload.secret)
 
-    if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
+    asset = payload.asset.strip().upper()
+    event = payload.event.strip().upper()
 
-    event = payload.event.upper().strip()
-
+    # ENTRY (one trade per asset)
     if event == "ENTRY":
-        if STATE.active_trade is not None:
-            return {"ok": True, "ignored": True, "reason": "active_trade_exists"}
+        if asset in STATE.active_trades:
+            return {"ok": True, "ignored": True, "reason": "active_trade_exists_for_asset", "asset": asset}
 
         trade = Trade(
             trade_id=payload.trade_id,
-            asset=payload.asset,
-            exchange=payload.exchange,
-            direction=payload.direction,
+            asset=asset,
+            exchange=payload.exchange.strip(),
+            direction=payload.direction.strip().upper(),
             entry=payload.entry,
             sl=payload.sl,
             tp1=payload.tp1,
             tp2=payload.tp2,
             tp3=payload.tp3,
-            bias_15m=payload.bias_15m,
-            confidence=payload.confidence,
-            session=payload.session,
+            bias_15m=payload.bias_15m.strip().upper(),
+            confidence=int(payload.confidence),
+            session=payload.session.strip(),
             status="ACTIVE",
             opened_at_utc=datetime.now(timezone.utc).isoformat()
         )
-        STATE.active_trade = trade
-        save_state(STATE)
-        tg_send(format_signal(trade))
-        return {"ok": True, "status": "active_set"}
 
+        STATE.active_trades[asset] = trade
+        save_state(STATE)
+
+        await tg_send(_fmt_signal(trade))
+        return {"ok": True, "status": "active_set", "asset": asset}
+
+    # RESOLVE (close trade for that asset)
     if event == "RESOLVE":
-        if STATE.active_trade is None:
-            return {"ok": True, "ignored": True, "reason": "no_active_trade"}
+        if asset not in STATE.active_trades:
+            return {"ok": True, "ignored": True, "reason": "no_active_trade_for_asset", "asset": asset}
 
-        if payload.trade_id != STATE.active_trade.trade_id:
-            return {"ok": True, "ignored": True, "reason": "trade_id_mismatch"}
+        active = STATE.active_trades[asset]
+        if payload.trade_id != active.trade_id:
+            return {"ok": True, "ignored": True, "reason": "trade_id_mismatch", "asset": asset}
 
-        result = (payload.result or "").upper()
+        result = (payload.result or "").strip().upper()
         if result not in ("WIN", "LOSS"):
-            raise HTTPException(status_code=400, detail="Invalid result")
+            raise HTTPException(status_code=400, detail="Invalid result (WIN/LOSS required)")
 
-        STATE.perf.trades += 1
+        perf = _get_perf(asset)
+        perf.trades += 1
         if result == "WIN":
-            STATE.perf.wins += 1
-            STATE.perf.consec_losses = 0
+            perf.wins += 1
+            perf.consec_losses = 0
         else:
-            STATE.perf.losses += 1
-            STATE.perf.consec_losses += 1
+            perf.losses += 1
+            perf.consec_losses += 1
 
-        trade = STATE.active_trade
-        trade.status = result
-        tg_send(format_update(trade, result))
+        active.status = result
+        await tg_send(_fmt_update(active, result))
 
-        STATE.active_trade = None
+        del STATE.active_trades[asset]
         save_state(STATE)
-        return {"ok": True, "closed": True}
+        return {"ok": True, "closed": True, "asset": asset}
 
-    raise HTTPException(status_code=400, detail="Unknown event")
+    raise HTTPException(status_code=400, detail="Unknown event (ENTRY/RESOLVE)")
+
+# =========================
+# ADMIN / DEBUG (safe with secret)
+# =========================
+@app.post("/admin/ping")
+async def admin_ping(payload: dict):
+    _require_secret(payload.get("secret", ""))
+    await tg_send(f"{BOT_NAME}\nTelegram test: OK ✅")
+    return {"ok": True, "telegram": "sent"}
+
+@app.get("/state")
+def state_view():
+    # no secret required for read; remove if you want it private
+    return {
+        "active_assets": list(STATE.active_trades.keys()),
+        "active_trades": {a: asdict(t) for a, t in STATE.active_trades.items()},
+        "perf_by_asset": {a: asdict(p) for a, p in STATE.perf_by_asset.items()},
+    }
+
+@app.post("/admin/reset")
+def admin_reset(payload: dict):
+    _require_secret(payload.get("secret", ""))
+    asset = str(payload.get("asset", "")).strip().upper()
+
+    if asset:
+        existed = asset in STATE.active_trades
+        if existed:
+            del STATE.active_trades[asset]
+        save_state(STATE)
+        return {"ok": True, "reset": True, "asset": asset, "existed": existed}
+
+    # reset all
+    STATE.active_trades = {}
+    save_state(STATE)
+    return {"ok": True, "reset": True, "asset": "ALL"}
