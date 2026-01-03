@@ -145,6 +145,19 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "bot": BOT_NAME}
+    @app.post("/admin/ping")
+async def admin_ping(payload: dict):
+    if WEBHOOK_SECRET and payload.get("secret") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+    try:
+        Bot(token=TELEGRAM_TOKEN).send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=f"{BOT_NAME}\nTelegram test: OK ✅"
+        )
+        return {"ok": True, "telegram": "sent"}
+    except Exception as e:
+        return {"ok": False, "telegram_error": str(e)}
 
 @app.post("/tv")
 async def tv_webhook(payload: TVPayload, request: Request):
