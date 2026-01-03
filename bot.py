@@ -1,312 +1,372 @@
 import os
 import json
 import logging
-from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Dict, Optional, Any
 
-import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict
+
+from telegram import Bot
+
 
 # =========================
-# LOGGING
+# Config
 # =========================
+BOT_NAME = os.getenv("BOT_NAME", "🜂 OBSIDIAN GOLD PRIME")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "8f2c9b1a-ChangeMe")   # TradingView secret
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "8f2c9b1a-ChangeMe")       # Admin endpoints secret
+
+STATE_FILE = os.getenv("STATE_FILE", "/tmp/obsidian_state.json")
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 log = logging.getLogger("obsidian")
 
-# =========================
-# ENV
-# =========================
-BOT_NAME = os.getenv("BOT_NAME", "🜂 OBSIDIAN GOLD PRIME")
+app = FastAPI(title=BOT_NAME)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-
-# مهم: على Koyeb بدون Volume قد يختفي state عند إعادة النشر
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
 # =========================
-# DATA
-# =========================
-@dataclass
-class Trade:
-    trade_id: str
-    asset: str
-    exchange: str
-    direction: str  # BUY / SELL
-    entry: float
-    sl: float
-    tp1: float
-    tp2: float
-    tp3: float
-    bias_15m: str
-    confidence: int
-    session: str
-    status: str  # ACTIVE / WIN / LOSS
-    opened_at_utc: str
-
-@dataclass
-class Performance:
-    trades: int = 0
-    wins: int = 0
-    losses: int = 0
-    consec_losses: int = 0
-
-@dataclass
-class State:
-    # صفقة واحدة لكل أصل
-    active_trades: Dict[str, Trade]
-    perf: Performance
-
-# =========================
-# IO
-# =========================
-def _safe_load_json(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        log.error("STATE load failed: %s", e)
-        return {}
-
-def load_state() -> State:
-    raw = _safe_load_json(STATE_FILE)
-    at = raw.get("active_trades", {}) or {}
-    active_trades: Dict[str, Trade] = {}
-    for k, v in at.items():
-        try:
-            active_trades[k] = Trade(**v)
-        except Exception:
-            continue
-    perf = Performance(**(raw.get("perf", {}) or {}))
-    return State(active_trades=active_trades, perf=perf)
-
-def save_state(state: State) -> None:
-    raw = {
-        "active_trades": {k: asdict(v) for k, v in state.active_trades.items()},
-        "perf": asdict(state.perf),
-    }
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(raw, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
-
-# =========================
-# TELEGRAM (HTTP API)
-# =========================
-def tg_send(text: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured (missing TELEGRAM_TOKEN/TELEGRAM_CHAT_ID).")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            log.error("Telegram send failed: %s | %s", r.status_code, r.text[:300])
-            return False
-        return True
-    except Exception as e:
-        log.error("Telegram send exception: %s", e)
-        return False
-
-def format_signal(trade: Trade) -> str:
-    return (
-        f"{BOT_NAME}\n"
-        "Institutional Scalping Signal\n\n"
-        f"Asset: {trade.asset}\n"
-        f"Exchange: {trade.exchange}\n"
-        f"Direction: {trade.direction}\n"
-        f"Confidence: {trade.confidence} / 100\n"
-        f"Session: {trade.session}\n\n"
-        f"Entry: {trade.entry:.2f}\n"
-        f"SL: {trade.sl:.2f}\n"
-        f"TP1: {trade.tp1:.2f}\n"
-        f"TP2: {trade.tp2:.2f}\n"
-        f"TP3: {trade.tp3:.2f}\n\n"
-        f"HTF Bias (15M): {trade.bias_15m}\n"
-        f"Trade ID: {trade.trade_id}\n"
-        "Status: ACTIVE ✅"
-    )
-
-def format_update(trade: Trade, result: str) -> str:
-    emoji = "🏆" if result == "WIN" else "🛑"
-    return (
-        f"{BOT_NAME}\n"
-        f"Trade Update {emoji}\n\n"
-        f"Asset: {trade.asset}\n"
-        f"Direction: {trade.direction}\n"
-        f"Result: {result}\n"
-        f"Entry: {trade.entry:.2f} | SL: {trade.sl:.2f} | TP1: {trade.tp1:.2f}\n"
-        f"Trade ID: {trade.trade_id}"
-    )
-
-# =========================
-# WEBHOOK SCHEMA (يدعم مفاتيح قصيرة لتفادي حد 300/JSON)
-# long keys: secret,event,trade_id,asset,exchange,direction,entry,sl,tp1,tp2,tp3,bias_15m,confidence,session,result
-# short keys: s,e,id,a,x,d,en,sl,t1,t2,t3,b,c,se,r
-# =========================
-class TVPayload(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
-    secret: str = Field(alias="s")
-    event: str = Field(alias="e")          # ENTRY / RESOLVE
-    trade_id: str = Field(alias="id")
-
-    asset: str = Field(alias="a")
-    exchange: str = Field(alias="x")
-    direction: str = Field(alias="d")      # BUY / SELL
-
-    entry: float = Field(alias="en")
-    sl: float = Field(alias="sl")
-    tp1: float = Field(alias="t1")
-    tp2: float = Field(alias="t2")
-    tp3: float = Field(alias="t3")
-
-    bias_15m: str = Field(alias="b")
-    confidence: int = Field(alias="c")
-    session: str = Field(alias="se")
-    result: Optional[str] = Field(default=None, alias="r")
-
-# =========================
-# ADMIN SCHEMAS
+# Models
 # =========================
 class AdminSecret(BaseModel):
     secret: str
+
 
 class AdminNotify(BaseModel):
     secret: str
     text: str
 
+
+class TVPayload(BaseModel):
+    """
+    Supports BOTH:
+      long keys: secret, event, trade_id, asset, exchange, direction, entry, sl, tp1, tp2, tp3, bias_15m, confidence, session, result
+      short keys: s, e, id, a, x, d, en, sl, t1, t2, t3, b, c, se, r
+    """
+    model_config = ConfigDict(populate_by_name=True)
+
+    secret: str = Field(validation_alias=AliasChoices("secret", "s"))
+    event: str = Field(validation_alias=AliasChoices("event", "e"))
+    trade_id: str = Field(validation_alias=AliasChoices("trade_id", "id"))
+
+    asset: str = Field(validation_alias=AliasChoices("asset", "a"))
+    exchange: str = Field(validation_alias=AliasChoices("exchange", "x"))
+    direction: str = Field(validation_alias=AliasChoices("direction", "d"))
+
+    entry: float = Field(validation_alias=AliasChoices("entry", "en"))
+    sl: float = Field(validation_alias=AliasChoices("sl", "sl"))
+    tp1: float = Field(validation_alias=AliasChoices("tp1", "t1"))
+    tp2: float = Field(validation_alias=AliasChoices("tp2", "t2"))
+    tp3: float = Field(validation_alias=AliasChoices("tp3", "t3"))
+
+    bias_15m: str = Field(validation_alias=AliasChoices("bias_15m", "b"))
+    confidence: int = Field(validation_alias=AliasChoices("confidence", "c"))
+    session: str = Field(validation_alias=AliasChoices("session", "se"))
+
+    # optional: resolve result (TP1/TP2/TP3/SL/CANCEL/BE) etc
+    result: Optional[str] = Field(default=None, validation_alias=AliasChoices("result", "r"))
+
+
 # =========================
-# APP
+# State
 # =========================
-app = FastAPI()
-STATE = load_state()
-log.info(
-    "BOOT OK | bot=%s | state_loaded=yes | active_assets=%s",
-    BOT_NAME,
-    len(STATE.active_trades),
-)
+# One active trade per asset:
+# state["active"][asset] = {trade_id, status, ...}
+state: Dict[str, Any] = {
+    "active": {},     # per-asset current trade
+    "history": [],    # last events
+    "meta": {
+        "bot": BOT_NAME,
+        "started_at": None,
+        "last_event_at": None
+    }
+}
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_state():
+    global state
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict) and "active" in loaded and "history" in loaded:
+                state = loaded
+                log.info("STATE LOADED | file=%s | active_assets=%s", STATE_FILE, len(state.get("active", {})))
+            else:
+                log.warning("STATE FILE INVALID STRUCTURE | ignoring")
+    except Exception as e:
+        log.warning("STATE LOAD FAILED | %s", e)
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("STATE SAVE FAILED | %s", e)
+
+
+# =========================
+# Telegram
+# =========================
+tg_bot: Optional[Bot] = None
+
+
+async def tg_send(text: str) -> bool:
+    if not tg_bot or not TELEGRAM_CHAT_ID:
+        log.warning("TELEGRAM NOT CONFIGURED | token=%s chat_id=%s", bool(TELEGRAM_TOKEN), bool(TELEGRAM_CHAT_ID))
+        return False
+    try:
+        await tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+        return True
+    except Exception as e:
+        log.error("TELEGRAM SEND FAILED | %s", e)
+        return False
+
+
+def fmt_price(x: float) -> str:
+    # Keep readable. Adjust decimals as you like.
+    if abs(x) >= 1000:
+        return f"{x:,.2f}"
+    return f"{x:.4f}"
+
+
+def build_entry_message(p: TVPayload) -> str:
+    # Nice compact message for Telegram
+    dir_icon = "🟢 BUY" if p.direction.upper() == "BUY" else "🔴 SELL"
+    return (
+        f"{BOT_NAME}\n"
+        f"🧾 ENTRY SIGNAL\n\n"
+        f"Asset: {p.asset} | Exchange: {p.exchange}\n"
+        f"Direction: {dir_icon}\n"
+        f"Trade ID: {p.trade_id}\n"
+        f"Bias(15m): {p.bias_15m} | Confidence: {p.confidence}\n"
+        f"Session: {p.session}\n\n"
+        f"Entry: {fmt_price(p.entry)}\n"
+        f"SL: {fmt_price(p.sl)}\n"
+        f"TP1: {fmt_price(p.tp1)}\n"
+        f"TP2: {fmt_price(p.tp2)}\n"
+        f"TP3: {fmt_price(p.tp3)}\n"
+    )
+
+
+def build_resolve_message(p: TVPayload, result: str) -> str:
+    r = (result or "").upper().strip()
+    tag = "✅ RESOLVED"
+    if r in {"SL", "STOP", "STOPLOSS"}:
+        tag = "🛑 STOP LOSS"
+    elif r in {"TP1", "TP2", "TP3"}:
+        tag = f"🎯 {r} HIT"
+    elif r in {"CANCEL"}:
+        tag = "⚠️ CANCELLED"
+    return (
+        f"{BOT_NAME}\n"
+        f"{tag}\n\n"
+        f"Asset: {p.asset} | Exchange: {p.exchange}\n"
+        f"Direction: {p.direction}\n"
+        f"Trade ID: {p.trade_id}\n"
+        f"Result: {result}\n"
+    )
+
+
+# =========================
+# Helpers
+# =========================
+def require_admin(secret: str):
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_webhook(secret: str):
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Bad secret")
+
+
+def append_history(item: dict):
+    state["history"].append(item)
+    # keep history size under control
+    if len(state["history"]) > 200:
+        state["history"] = state["history"][-200:]
+
+
+# =========================
+# Routes
+# =========================
+@app.on_event("startup")
+async def startup():
+    global tg_bot
+    state["meta"]["started_at"] = utc_now_iso()
+    load_state()
+    if TELEGRAM_TOKEN:
+        tg_bot = Bot(token=TELEGRAM_TOKEN)
+    log.info("BOOT OK | bot=%s | state_loaded=%s | active_assets=%s",
+             BOT_NAME, "yes" if state.get("meta", {}).get("started_at") else "no", len(state.get("active", {})))
+
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "obsidian-gold-prime", "bot": BOT_NAME}
+    return {"ok": True, "bot": BOT_NAME}
+
 
 @app.get("/health")
 def health():
-    return {"ok": True, "bot": BOT_NAME}
+    return {"ok": True, "status": "healthy", "bot": BOT_NAME}
+
 
 @app.get("/state")
 def state_view():
     return {
         "ok": True,
-        "active_trades": {k: asdict(v) for k, v in STATE.active_trades.items()},
-        "perf": asdict(STATE.perf),
+        "bot": BOT_NAME,
+        "active_set": list(state.get("active", {}).keys()),
+        "active": state.get("active", {}),
+        "history_tail": state.get("history", [])[-10:],
+        "meta": state.get("meta", {})
     }
 
-def _auth_or_401(secret: str):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
 
 @app.post("/admin/ping")
-def admin_ping(payload: AdminSecret):
-    _auth_or_401(payload.secret)
-    sent = tg_send(f"{BOT_NAME}\n✅ Telegram OK (admin/ping)")
-    return {"ok": True, "telegram": "sent" if sent else "failed"}
+async def admin_ping(payload: AdminSecret):
+    require_admin(payload.secret)
+    sent = await tg_send(f"{BOT_NAME}\n✅ Admin ping OK\n{utc_now_iso()}")
+    return {"ok": True, "telegram": "sent" if sent else "not_configured"}
+
 
 @app.post("/admin/notify")
-def admin_notify(payload: AdminNotify):
-    _auth_or_401(payload.secret)
-    sent = tg_send(f"{BOT_NAME}\n{payload.text}")
-    return {"ok": True, "telegram": "sent" if sent else "failed"}
+async def admin_notify(payload: AdminNotify):
+    require_admin(payload.secret)
+    sent = await tg_send(f"{BOT_NAME}\n📣 Admin notify:\n{payload.text}")
+    return {"ok": True, "telegram": "sent" if sent else "not_configured"}
+
 
 @app.post("/admin/reset")
-def admin_reset(payload: AdminSecret):
-    _auth_or_401(payload.secret)
-    STATE.active_trades = {}
-    STATE.perf = Performance()
-    save_state(STATE)
-    return {"ok": True, "reset": True}
+async def admin_reset(payload: AdminSecret):
+    require_admin(payload.secret)
+    state["active"] = {}
+    append_history({"ts": utc_now_iso(), "type": "ADMIN_RESET"})
+    save_state()
+    sent = await tg_send(f"{BOT_NAME}\n♻️ State reset done.\n{utc_now_iso()}")
+    return {"ok": True, "telegram": "sent" if sent else "not_configured"}
+
 
 @app.post("/tv")
-def tv_webhook(payload: TVPayload):
-    _auth_or_401(payload.secret)
+async def tv_webhook(p: TVPayload):
+    # Security
+    require_webhook(p.secret)
 
-    event = payload.event.upper().strip()
-    asset_key = (payload.asset or "").upper().strip()
+    # Normalize event
+    event = p.event.upper().strip()
+    asset = p.asset.upper().strip()
 
-    if not asset_key:
-        raise HTTPException(status_code=400, detail="Missing asset")
+    state["meta"]["last_event_at"] = utc_now_iso()
 
-    # ENTRY
+    # Enforce: one active trade per asset
+    active_trade = state["active"].get(asset)
+
     if event == "ENTRY":
-        if asset_key in STATE.active_trades:
-            return {"ok": True, "ignored": True, "reason": "active_trade_exists_for_asset", "asset": asset_key}
+        # If there is already an active trade for this asset and it differs -> ignore
+        if active_trade and active_trade.get("status") == "OPEN":
+            if active_trade.get("trade_id") != p.trade_id:
+                append_history({
+                    "ts": utc_now_iso(),
+                    "type": "ENTRY_IGNORED",
+                    "reason": "active_trade_exists",
+                    "asset": asset,
+                    "incoming_trade_id": p.trade_id,
+                    "active_trade_id": active_trade.get("trade_id"),
+                })
+                save_state()
+                return {"ok": True, "ignored": True, "reason": "active_trade_exists"}
 
-        trade = Trade(
-            trade_id=payload.trade_id,
-            asset=asset_key,
-            exchange=payload.exchange,
-            direction=payload.direction.upper(),
-            entry=float(payload.entry),
-            sl=float(payload.sl),
-            tp1=float(payload.tp1),
-            tp2=float(payload.tp2),
-            tp3=float(payload.tp3),
-            bias_15m=payload.bias_15m,
-            confidence=int(payload.confidence),
-            session=payload.session,
-            status="ACTIVE",
-            opened_at_utc=datetime.now(timezone.utc).isoformat(),
-        )
+        # Set active
+        state["active"][asset] = {
+            "trade_id": p.trade_id,
+            "status": "OPEN",
+            "asset": asset,
+            "exchange": p.exchange,
+            "direction": p.direction,
+            "entry": p.entry,
+            "sl": p.sl,
+            "tp1": p.tp1,
+            "tp2": p.tp2,
+            "tp3": p.tp3,
+            "bias_15m": p.bias_15m,
+            "confidence": p.confidence,
+            "session": p.session,
+            "opened_at": utc_now_iso(),
+            "last_update": utc_now_iso(),
+        }
 
-        STATE.active_trades[asset_key] = trade
-        save_state(STATE)
-        tg_send(format_signal(trade))
-        return {"ok": True, "status": "active_set", "asset": asset_key}
+        append_history({
+            "ts": utc_now_iso(),
+            "type": "ENTRY",
+            "asset": asset,
+            "trade_id": p.trade_id,
+            "direction": p.direction,
+            "confidence": p.confidence,
+        })
+        save_state()
 
-    # RESOLVE
-    if event == "RESOLVE":
-        trade = STATE.active_trades.get(asset_key)
-        if not trade:
-            return {"ok": True, "ignored": True, "reason": "no_active_trade_for_asset", "asset": asset_key}
+        sent = await tg_send(build_entry_message(p))
+        return {"ok": True, "telegram": "sent" if sent else "not_configured", "active_set": list(state["active"].keys())}
 
-        if payload.trade_id != trade.trade_id:
-            return {"ok": True, "ignored": True, "reason": "trade_id_mismatch", "asset": asset_key}
+    elif event in {"RESOLVE", "CLOSE", "EXIT"}:
+        # Must have active trade and same trade_id
+        if not active_trade or active_trade.get("status") != "OPEN":
+            append_history({
+                "ts": utc_now_iso(),
+                "type": "RESOLVE_IGNORED",
+                "reason": "no_active_trade",
+                "asset": asset,
+                "incoming_trade_id": p.trade_id,
+            })
+            save_state()
+            return {"ok": True, "ignored": True, "reason": "no_active_trade"}
 
-        result = (payload.result or "").upper().strip()
-        if result not in ("WIN", "LOSS"):
-            raise HTTPException(status_code=400, detail="Invalid result (use WIN/LOSS)")
+        if active_trade.get("trade_id") != p.trade_id:
+            append_history({
+                "ts": utc_now_iso(),
+                "type": "RESOLVE_IGNORED",
+                "reason": "trade_id_mismatch",
+                "asset": asset,
+                "incoming_trade_id": p.trade_id,
+                "active_trade_id": active_trade.get("trade_id"),
+            })
+            save_state()
+            return {"ok": True, "ignored": True, "reason": "trade_id_mismatch"}
 
-        # تحديث الأداء (عام)
-        STATE.perf.trades += 1
-        if result == "WIN":
-            STATE.perf.wins += 1
-            STATE.perf.consec_losses = 0
-        else:
-            STATE.perf.losses += 1
-            STATE.perf.consec_losses += 1
+        # Close
+        result = p.result or "CLOSE"
+        active_trade["status"] = "CLOSED"
+        active_trade["result"] = result
+        active_trade["closed_at"] = utc_now_iso()
+        active_trade["last_update"] = utc_now_iso()
 
-        trade.status = result
-        tg_send(format_update(trade, result))
+        append_history({
+            "ts": utc_now_iso(),
+            "type": "RESOLVE",
+            "asset": asset,
+            "trade_id": p.trade_id,
+            "result": result,
+        })
 
-        # إغلاق الصفقة لهذا الأصل فقط
-        del STATE.active_trades[asset_key]
-        save_state(STATE)
-        return {"ok": True, "closed": True, "asset": asset_key}
+        # Remove from active after resolve (or keep? we remove to allow new trade)
+        state["active"].pop(asset, None)
 
-    raise HTTPException(status_code=400, detail="Unknown event (use ENTRY/RESOLVE)")
+        save_state()
+        sent = await tg_send(build_resolve_message(p, result))
+        return {"ok": True, "telegram": "sent" if sent else "not_configured"}
+
+    else:
+        append_history({"ts": utc_now_iso(), "type": "UNKNOWN_EVENT", "event": p.event, "asset": asset})
+        save_state()
+        return {"ok": True, "ignored": True, "reason": "unknown_event", "event": p.event}
