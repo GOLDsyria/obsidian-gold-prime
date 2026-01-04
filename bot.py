@@ -1,6 +1,6 @@
 import os, json, asyncio, csv, io
 from datetime import datetime, timezone, date, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
@@ -19,23 +19,28 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/obsidian_state.json")
 
-REPORT_EVERY_MIN = int(os.getenv("REPORT_EVERY_MIN", "180"))  # 3 hours default
+# Default: 30 minutes (you asked: every half-hour)
+REPORT_EVERY_MIN = int(os.getenv("REPORT_EVERY_MIN", "30"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "55"))
 
-# Allowed assets (Gold/Silver only now)
-ALLOWED_ASSETS = {"XAUUSD", "XAGUSD"}
+# Allowed assets: Gold/Silver + BTC
+ALLOWED_ASSETS = {"XAUUSD", "XAGUSD", "BTCUSD"}
 
 # Circuit breaker
-CB_LOOKBACK = int(os.getenv("CB_LOOKBACK", "10"))          # last N resolves
+CB_LOOKBACK = int(os.getenv("CB_LOOKBACK", "10"))
 CB_MIN_TRADES = int(os.getenv("CB_MIN_TRADES", "8"))
-CB_MIN_WR = float(os.getenv("CB_MIN_WR", "35"))            # WR% threshold
-CB_MIN_RSUM = float(os.getenv("CB_MIN_RSUM", "-3.0"))      # R sum threshold
-CB_FREEZE_MIN = int(os.getenv("CB_FREEZE_MIN", "90"))      # freeze minutes
+CB_MIN_WR = float(os.getenv("CB_MIN_WR", "35"))
+CB_MIN_RSUM = float(os.getenv("CB_MIN_RSUM", "-3.0"))
+CB_FREEZE_MIN = int(os.getenv("CB_FREEZE_MIN", "90"))
 
 # Auto-disable weak setups
 SETUP_MIN_TRADES = int(os.getenv("SETUP_MIN_TRADES", "12"))
-SETUP_MIN_WR = float(os.getenv("SETUP_MIN_WR", "42"))      # disable if below
+SETUP_MIN_WR = float(os.getenv("SETUP_MIN_WR", "42"))
 SETUP_DISABLE_MIN = int(os.getenv("SETUP_DISABLE_MIN", "240"))
+
+# Optional: allow re-entry after TP1 (default OFF)
+ALLOW_REENTRY_AFTER_TP1 = os.getenv("ALLOW_REENTRY_AFTER_TP1", "0").strip() == "1"
+
 
 # =========================
 # HELPERS
@@ -56,6 +61,7 @@ def norm_dir(d: str) -> str:
     x = (d or "").strip().upper()
     if x == "LONG": return "BUY"
     if x == "SHORT": return "SELL"
+    if x in ("BUY", "SELL"): return x
     return x
 
 def fmt_price(x: Optional[float]) -> str:
@@ -101,6 +107,15 @@ def expectancy(b: Dict[str, float]) -> float:
     t = b.get("trades", 0.0)
     return (b.get("r_sum", 0.0) / t) if t else 0.0
 
+def report_label() -> str:
+    # nice label: 30m / 3H / 1H ...
+    m = max(1, int(REPORT_EVERY_MIN))
+    if m % 60 == 0:
+        h = m // 60
+        return f"{h}H Market Pulse"
+    return f"{m}m Market Pulse"
+
+
 # =========================
 # STATE
 # =========================
@@ -111,7 +126,7 @@ state: Dict[str, Any] = {
     "perf": {"total": blank_stats(), "by_setup": {}, "daily": {}},
     "dedupe": {"seen": []},
     "cb": {"frozen_until": None},
-    "disabled_setups": {},  # "XAUUSD|SMC_CORE" -> until_iso
+    "disabled_setups": {},  # "XAUUSD|CORE" -> until_iso
     "recent_resolves": []   # list of {ts, asset, setup, result, r}
 }
 
@@ -186,6 +201,21 @@ def disable_setup(asset: str, setup: str, minutes: int, reason: str):
     state.setdefault("disabled_setups", {})[key] = until.isoformat(timespec="seconds")
     hist({"ts": utc_now_iso(), "type": "SETUP_DISABLED", "key": key, "minutes": minutes, "reason": reason})
 
+def check_circuit_breaker():
+    rr = state.get("recent_resolves", [])
+    if len(rr) < CB_MIN_TRADES:
+        return
+    window = rr[-CB_LOOKBACK:]
+    t = len(window)
+    if t < CB_MIN_TRADES:
+        return
+    wins = sum(1 for x in window if x["result"] == "TP1")
+    wr = wins / t * 100.0
+    rsum = sum(float(x.get("r", 0.0)) for x in window)
+    if wr < CB_MIN_WR or rsum <= CB_MIN_RSUM:
+        if not is_cb_frozen():
+            freeze_cb(CB_FREEZE_MIN, f"CB: last{t} WR={wr:.1f}% rsum={rsum:.1f}")
+
 def record_setup(asset: str, setup: str, result: str):
     res = (result or "").upper()
     is_win = res == "TP1"
@@ -212,37 +242,19 @@ def record_setup(asset: str, setup: str, result: str):
     if is_win: d["wins"] += 1
     if is_loss: d["losses"] += 1
 
-    # rolling resolves for circuit breaker
     rr = state.setdefault("recent_resolves", [])
     rr.append({"ts": utc_now_iso(), "asset": asset, "setup": setup, "result": res, "r": r})
     if len(rr) > 60:
         state["recent_resolves"] = rr[-60:]
 
-    # auto-disable weak setups (after enough trades)
     if int(b["trades"]) >= SETUP_MIN_TRADES:
         wr = winrate(b)
         if wr < SETUP_MIN_WR:
             disable_setup(asset, setup, SETUP_DISABLE_MIN, f"Auto-disable: WR {wr:.1f}% < {SETUP_MIN_WR}% ({int(b['trades'])} trades)")
 
-    # circuit breaker check
     check_circuit_breaker()
-
     save_state()
 
-def check_circuit_breaker():
-    rr = state.get("recent_resolves", [])
-    if len(rr) < CB_MIN_TRADES:
-        return
-    window = rr[-CB_LOOKBACK:]
-    t = len(window)
-    if t < CB_MIN_TRADES:
-        return
-    wins = sum(1 for x in window if x["result"] == "TP1")
-    wr = wins / t * 100.0
-    rsum = sum(float(x.get("r", 0.0)) for x in window)
-    if wr < CB_MIN_WR or rsum <= CB_MIN_RSUM:
-        if not is_cb_frozen():
-            freeze_cb(CB_FREEZE_MIN, f"CB: last{t} WR={wr:.1f}% rsum={rsum:.1f}")
 
 # =========================
 # API MODELS
@@ -255,23 +267,29 @@ class AdminNotify(BaseModel):
     text: str
 
 class TVPayload(BaseModel):
+    """
+    NOTE:
+    - ENTRY/RESOLVE needs trade fields.
+    - PRICE only needs (secret,event,asset,exchange,price,time/session/setup optional).
+    So we make trade fields optional.
+    """
     model_config = ConfigDict(populate_by_name=True)
 
     secret: str = Field(validation_alias=AliasChoices("secret", "s"))
     event: str = Field(validation_alias=AliasChoices("event", "e"))
-    trade_id: str = Field(validation_alias=AliasChoices("trade_id", "id"))
+    trade_id: Optional[str] = Field(default=None, validation_alias=AliasChoices("trade_id", "id"))
 
     asset: str = Field(validation_alias=AliasChoices("asset", "a"))
-    exchange: str = Field(validation_alias=AliasChoices("exchange", "x"))
-    direction: str = Field(validation_alias=AliasChoices("direction", "d"))
+    exchange: str = Field(default="TV", validation_alias=AliasChoices("exchange", "x"))
+    direction: Optional[str] = Field(default=None, validation_alias=AliasChoices("direction", "d"))
 
-    entry: float = Field(validation_alias=AliasChoices("entry", "en"))
-    sl: float = Field(validation_alias=AliasChoices("sl", "sl"))
-    tp1: float = Field(validation_alias=AliasChoices("tp1", "t1"))
-    tp2: float = Field(validation_alias=AliasChoices("tp2", "t2"))
-    tp3: float = Field(validation_alias=AliasChoices("tp3", "t3"))
+    entry: Optional[float] = Field(default=None, validation_alias=AliasChoices("entry", "en"))
+    sl: Optional[float] = Field(default=None, validation_alias=AliasChoices("sl", "sl"))
+    tp1: Optional[float] = Field(default=None, validation_alias=AliasChoices("tp1", "t1"))
+    tp2: Optional[float] = Field(default=None, validation_alias=AliasChoices("tp2", "t2"))
+    tp3: Optional[float] = Field(default=None, validation_alias=AliasChoices("tp3", "t3"))
 
-    bias_15m: str = Field(validation_alias=AliasChoices("bias_15m", "b"))
+    bias_15m: Optional[str] = Field(default=None, validation_alias=AliasChoices("bias_15m", "b"))
     confidence: int = Field(default=0, validation_alias=AliasChoices("confidence", "c"))
     session: str = Field(default="ALL", validation_alias=AliasChoices("session", "se"))
 
@@ -280,11 +298,16 @@ class TVPayload(BaseModel):
     score: int = Field(default=0, validation_alias=AliasChoices("score", "sc"))
     price: Optional[float] = Field(default=None, validation_alias=AliasChoices("price", "p"))
 
+    # optional timestamp from TV (if you want)
+    t: Optional[str] = Field(default=None, validation_alias=AliasChoices("t", "ts"))
+
+
 # =========================
 # APP
 # =========================
-app = FastAPI(title="OBSIDIAN PRIME", version="6.0.0")
+app = FastAPI(title="OBSIDIAN PRIME", version="6.1.0")
 load_state()
+
 
 # =========================
 # MESSAGE FORMATTERS
@@ -302,13 +325,13 @@ def msg_entry(p: TVPayload) -> str:
         f"{BOT_NAME}\n"
         f"🟢 ENTRY\n"
         f"Asset: {p.asset}  ({p.exchange})\n"
-        f"Dir: {norm_dir(p.direction)}\n"
+        f"Dir: {norm_dir(p.direction or '')}\n"
         f"Entry: {fmt_price(p.entry)}\n"
         f"SL: {fmt_price(p.sl)}\n"
         f"TP1: {fmt_price(p.tp1)}\n"
         f"TP2: {fmt_price(p.tp2)}\n"
         f"TP3: {fmt_price(p.tp3)}\n"
-        f"Bias 15m: {p.bias_15m}\n"
+        f"Bias 15m: {p.bias_15m or 'N/A'}\n"
         f"Session: {p.session}\n"
         f"Score: {p.score} | Conf: {p.confidence}\n"
         f"Setup: {p.setup} | WR: {wr:.1f}% ({t}) | Exp(R): {exp:.3f}\n"
@@ -351,7 +374,7 @@ def msg_report() -> str:
 
     lines = [
         f"{BOT_NAME}",
-        "⏱️ 3H Market Pulse",
+        f"⏱️ {report_label()}",
         f"Circuit Breaker: {'FROZEN' if frozen else 'OK'}" + (f" until {frozen_until}" if frozen and frozen_until else ""),
         f"Active Trades: {', '.join(active_assets) if active_assets else 'None'}",
         f"Performance: Trades={t} | WR={wr:.1f}% | Exp(R)={exp:.3f}",
@@ -382,13 +405,14 @@ def msg_report() -> str:
 
     return "\n".join(lines)
 
+
 # =========================
 # BACKGROUND REPORTER
 # =========================
 async def reporter_loop():
     if REPORT_EVERY_MIN <= 0:
         return
-    await asyncio.sleep(20)
+    await asyncio.sleep(10)
     while True:
         try:
             await tg_send(msg_report())
@@ -400,12 +424,13 @@ async def reporter_loop():
 async def _startup():
     asyncio.create_task(reporter_loop())
 
+
 # =========================
 # ROUTES
 # =========================
 @app.get("/health")
 def health():
-    return {"ok": True, "bot": BOT_NAME, "version": "6.0.0"}
+    return {"ok": True, "bot": BOT_NAME, "version": "6.1.0"}
 
 @app.post("/admin/ping")
 async def admin_ping(p: AdminSecret):
@@ -469,6 +494,7 @@ def export_csv():
     data = out.getvalue().encode("utf-8")
     return Response(content=data, media_type="text/csv")
 
+
 # =========================
 # WEBHOOK
 # =========================
@@ -481,47 +507,77 @@ async def tv(p: TVPayload):
         raise HTTPException(status_code=400, detail=f"Asset not allowed: {asset}")
 
     ev = (p.event or "").strip().upper()
+    p.asset = asset
+    p.setup = (p.setup or "CORE").strip().upper()
+    p.session = (p.session or "ALL").strip()
+    if p.direction is not None:
+        p.direction = norm_dir(p.direction)
+
+    # -------------------------
+    # PRICE event: only update last_price
+    # -------------------------
+    if ev == "PRICE":
+        if p.price is None:
+            return {"ok": True, "ignored": True, "reason": "price_missing"}
+        state.setdefault("last_price", {})[asset] = {"price": float(p.price), "ts": utc_now_iso()}
+        hist({"ts": utc_now_iso(), "type": "PRICE", "asset": asset, "price": float(p.price)})
+        save_state()
+        return {"ok": True, "status": "price_updated", "asset": asset}
+
+    # -------------------------
+    # ENTRY/RESOLVE dedupe
+    # -------------------------
+    trade_id = (p.trade_id or "").strip()
     r = (p.result or "").strip().upper() if p.result else ""
-    dkey = f"{asset}|{ev}|{p.trade_id}|{r}"
+    dkey = f"{asset}|{ev}|{trade_id}|{r}"
     if dedupe_hit(dkey):
         return {"ok": True, "ignored": True, "reason": "duplicate_event"}
 
-    p.asset = asset
-    p.direction = norm_dir(p.direction)
-    p.setup = (p.setup or "CORE").strip().upper()
-    p.session = (p.session or "ALL").strip()
-
-    # update last known price
+    # -------------------------
+    # update last known price if provided on any event
+    # -------------------------
     if p.price is not None:
         state.setdefault("last_price", {})[asset] = {"price": float(p.price), "ts": utc_now_iso()}
         save_state()
 
+    # -------------------------
     # global freeze: ignore new entries
+    # -------------------------
     if ev == "ENTRY" and is_cb_frozen():
-        hist({"ts": utc_now_iso(), "type": "ENTRY_BLOCKED_CB", "asset": asset, "trade_id": p.trade_id, "setup": p.setup})
+        hist({"ts": utc_now_iso(), "type": "ENTRY_BLOCKED_CB", "asset": asset, "trade_id": trade_id, "setup": p.setup})
         return {"ok": True, "ignored": True, "reason": "circuit_breaker_frozen"}
 
     # setup disabled: ignore entries for that setup
     if ev == "ENTRY" and setup_disabled(asset, p.setup):
-        hist({"ts": utc_now_iso(), "type": "ENTRY_BLOCKED_SETUP", "asset": asset, "trade_id": p.trade_id, "setup": p.setup})
+        hist({"ts": utc_now_iso(), "type": "ENTRY_BLOCKED_SETUP", "asset": asset, "trade_id": trade_id, "setup": p.setup})
         return {"ok": True, "ignored": True, "reason": "setup_disabled"}
 
     # confidence gate
     if ev == "ENTRY" and int(p.confidence) < MIN_CONFIDENCE:
-        hist({"ts": utc_now_iso(), "type": "ENTRY_SKIP", "asset": asset, "trade_id": p.trade_id, "reason": "low_confidence", "c": p.confidence, "setup": p.setup})
+        hist({"ts": utc_now_iso(), "type": "ENTRY_SKIP", "asset": asset, "trade_id": trade_id, "reason": "low_confidence", "c": p.confidence, "setup": p.setup})
         return {"ok": True, "ignored": True, "reason": "low_confidence"}
 
+    # -------------------------
+    # ENTRY
+    # -------------------------
     if ev == "ENTRY":
-        # one active trade per asset
+        # Validate trade fields (must exist for ENTRY)
+        missing = [k for k in ("entry","sl","tp1","tp2") if getattr(p, k) is None]
+        if missing:
+            hist({"ts": utc_now_iso(), "type": "ENTRY_BAD_PAYLOAD", "asset": asset, "trade_id": trade_id, "missing": missing})
+            return {"ok": False, "error": "missing_trade_fields", "missing": missing}
+
+        # One active trade per asset
         if asset in state["active"]:
-            hist({"ts": utc_now_iso(), "type": "ENTRY_IGNORED_ACTIVE", "asset": asset, "incoming": p.trade_id, "active": state["active"][asset].get("trade_id"), "setup": p.setup})
+            # optional re-entry if TP1 already hit and you allow it (only if you design it in Pine logic)
+            hist({"ts": utc_now_iso(), "type": "ENTRY_IGNORED_ACTIVE", "asset": asset, "incoming": trade_id, "active": state["active"][asset].get("trade_id"), "setup": p.setup})
             return {"ok": True, "ignored": True, "reason": "active_trade_exists"}
 
         state["active"][asset] = {
-            "trade_id": p.trade_id,
+            "trade_id": trade_id,
             "asset": asset,
             "exchange": p.exchange,
-            "direction": p.direction,
+            "direction": p.direction or "NA",
             "entry": p.entry,
             "sl": p.sl,
             "tp1": p.tp1,
@@ -534,20 +590,23 @@ async def tv(p: TVPayload):
             "session": p.session,
             "opened_ts": utc_now_iso(),
         }
-        hist({"ts": utc_now_iso(), "type": "ENTRY", "asset": asset, "trade_id": p.trade_id, "setup": p.setup, "score": int(p.score), "day": today_utc()})
+        hist({"ts": utc_now_iso(), "type": "ENTRY", "asset": asset, "trade_id": trade_id, "setup": p.setup, "score": int(p.score), "day": today_utc()})
         save_state()
 
         sent = await tg_send(msg_entry(p))
         return {"ok": True, "status": "active_set", "asset": asset, "telegram": sent}
 
+    # -------------------------
+    # RESOLVE
+    # -------------------------
     if ev == "RESOLVE":
         active = state["active"].get(asset)
         if not active:
-            hist({"ts": utc_now_iso(), "type": "RESOLVE_NO_ACTIVE", "asset": asset, "trade_id": p.trade_id})
+            hist({"ts": utc_now_iso(), "type": "RESOLVE_NO_ACTIVE", "asset": asset, "trade_id": trade_id})
             return {"ok": True, "ignored": True, "reason": "no_active_trade"}
 
-        if str(active.get("trade_id")) != str(p.trade_id):
-            hist({"ts": utc_now_iso(), "type": "RESOLVE_MISMATCH", "asset": asset, "incoming": p.trade_id, "active": active.get("trade_id")})
+        if str(active.get("trade_id")) != str(trade_id):
+            hist({"ts": utc_now_iso(), "type": "RESOLVE_MISMATCH", "asset": asset, "incoming": trade_id, "active": active.get("trade_id")})
             return {"ok": True, "ignored": True, "reason": "trade_id_mismatch"}
 
         result = (p.result or "").strip().upper()
@@ -556,10 +615,10 @@ async def tv(p: TVPayload):
         record_setup(asset, setup, result)
 
         state["active"].pop(asset, None)
-        hist({"ts": utc_now_iso(), "type": "RESOLVE", "asset": asset, "trade_id": p.trade_id, "result": result, "setup": setup, "day": today_utc()})
+        hist({"ts": utc_now_iso(), "type": "RESOLVE", "asset": asset, "trade_id": trade_id, "result": result, "setup": setup, "day": today_utc()})
         save_state()
 
-        sent = await tg_send(msg_resolve(asset, p.trade_id, result, setup))
+        sent = await tg_send(msg_resolve(asset, trade_id, result, setup))
         return {"ok": True, "status": "closed", "asset": asset, "result": result, "telegram": sent}
 
     hist({"ts": utc_now_iso(), "type": "UNKNOWN_EVENT", "asset": asset, "event": ev})
