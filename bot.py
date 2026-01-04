@@ -1,14 +1,11 @@
 import os, json, asyncio
 from datetime import datetime, timezone, date
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 import httpx
 
-# =========================
-# ENV
-# =========================
 BOT_NAME = os.getenv("BOT_NAME", "🜂 OBSIDIAN GOLD PRIME").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -18,17 +15,12 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/obsidian_state.json")
 
-# every 3 hours by default
+# 3 hours default (180 minutes). Set 0 to disable.
 REPORT_EVERY_MIN = int(os.getenv("REPORT_EVERY_MIN", "180"))
 
 ALLOWED_ASSETS = {"XAUUSD", "XAGUSD", "BTCUSD", "BTCUSDT"}
-
-# server-side min confidence (Balanced => low)
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
 
-# =========================
-# HELPERS
-# =========================
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -81,21 +73,12 @@ def winrate(b: Dict[str, float]) -> float:
     t = b.get("trades", 0.0)
     return (b.get("wins", 0.0) / t * 100.0) if t else 0.0
 
-# =========================
-# STATE
-# =========================
 state: Dict[str, Any] = {
-    "active": {},          # asset -> trade dict
-    "last_price": {},      # asset -> {"price": float, "ts": str}
-    "history": [],         # last events
-    "perf": {
-        "total": blank_stats(),
-        "by_setup": {},    # key asset|setup
-        "daily": {},       # day -> stats
-    },
-    "dedupe": {
-        "seen": []         # keep last N event keys
-    }
+    "active": {},
+    "last_price": {},
+    "history": [],
+    "perf": {"total": blank_stats(), "by_setup": {}, "daily": {}},
+    "dedupe": {"seen": []},
 }
 
 def load_state():
@@ -123,7 +106,6 @@ def hist(e: Dict[str, Any]):
     save_state()
 
 def dedupe_hit(key: str) -> bool:
-    """Return True if already processed recently."""
     seen = state.setdefault("dedupe", {}).setdefault("seen", [])
     if key in seen:
         return True
@@ -158,9 +140,6 @@ def record_setup(asset: str, setup: str, result: str):
     if is_win: d["wins"] += 1
     if is_loss: d["losses"] += 1
 
-# =========================
-# MODELS
-# =========================
 class AdminSecret(BaseModel):
     secret: str
 
@@ -192,29 +171,18 @@ class TVPayload(BaseModel):
     result: Optional[str] = Field(default=None, validation_alias=AliasChoices("result", "r"))
     setup: str = Field(default="CORE", validation_alias=AliasChoices("setup", "st"))
     score: int = Field(default=0, validation_alias=AliasChoices("score", "sc"))
-
-    # optional last price (close) from script
     price: Optional[float] = Field(default=None, validation_alias=AliasChoices("price", "p"))
-    why: Optional[str] = Field(default=None, validation_alias=AliasChoices("why", "why"))
 
-# =========================
-# APP
-# =========================
-app = FastAPI(title="OBSIDIAN PRIME", version="5.0.0")
+app = FastAPI(title="OBSIDIAN PRIME", version="5.1.0")
 load_state()
-print(f"{utc_now_iso()} | INFO | BOOT OK | bot={BOT_NAME} | active_assets={len(state.get('active', {}))}")
 
-# =========================
-# MESSAGE FORMAT
-# =========================
 def msg_entry(p: TVPayload) -> str:
     k = f"{p.asset}|{p.setup}"
     b = state["perf"]["by_setup"].get(k, blank_stats())
     wr = winrate(b)
     t = int(b.get("trades", 0))
 
-    lastp = state.get("last_price", {}).get(p.asset, {})
-    lp = lastp.get("price", None)
+    lp = state.get("last_price", {}).get(p.asset, {}).get("price", None)
 
     return (
         f"{BOT_NAME}\n"
@@ -235,16 +203,16 @@ def msg_entry(p: TVPayload) -> str:
         f"{utc_now_iso()}"
     )
 
-def msg_resolve(p: TVPayload, result: str, setup: str) -> str:
+def msg_resolve(asset: str, trade_id: str, result: str, setup: str) -> str:
     res = (result or "").upper()
     tag = "✅ WIN (TP1)" if res == "TP1" else "❌ LOSS (SL)" if res == "SL" else f"ℹ️ {res}"
     return (
         f"{BOT_NAME}\n"
         f"🏁 RESOLVE\n"
-        f"Asset: {p.asset}\n"
+        f"Asset: {asset}\n"
         f"Result: {tag}\n"
         f"Setup: {setup}\n"
-        f"ID: {p.trade_id}\n"
+        f"ID: {trade_id}\n"
         f"{utc_now_iso()}"
     )
 
@@ -274,7 +242,6 @@ def msg_report() -> str:
         x = lp.get(a, {})
         lines.append(f"- {a}: {fmt_price(x.get('price'))}  ({x.get('ts','-')})")
 
-    # Top setups (min 8)
     setups = []
     for k, b in state["perf"].get("by_setup", {}).items():
         tt = int(b.get("trades", 0))
@@ -289,14 +256,9 @@ def msg_report() -> str:
 
     return "\n".join(lines)
 
-# =========================
-# SCHEDULER (3H report)
-# =========================
 async def reporter_loop():
-    # if REPORT_EVERY_MIN <= 0 => disabled
     if REPORT_EVERY_MIN <= 0:
         return
-    # slight delay on boot
     await asyncio.sleep(20)
     while True:
         try:
@@ -309,73 +271,10 @@ async def reporter_loop():
 async def _startup():
     asyncio.create_task(reporter_loop())
 
-# =========================
-# ROUTES
-# =========================
 @app.get("/health")
 def health():
     return {"ok": True, "bot": BOT_NAME}
 
-@app.get("/metrics")
-def metrics():
-    total = state["perf"]["total"]
-    t = int(total.get("trades", 0))
-    w = int(total.get("wins", 0))
-    l = int(total.get("losses", 0))
-    wr = (w / t * 100.0) if t else 0.0
-    exp = (float(total.get("r_sum", 0.0)) / t) if t else 0.0
-    return {
-        "ok": True,
-        "trades": t,
-        "wins": w,
-        "losses": l,
-        "winrate_pct": round(wr, 2),
-        "expectancy_R": round(exp, 3),
-        "active_assets": list(state.get("active", {}).keys()),
-        "report_every_min": REPORT_EVERY_MIN
-    }
-
-@app.get("/dashboard")
-def dashboard():
-    total = state["perf"]["total"]
-    t = int(total.get("trades", 0))
-    w = int(total.get("wins", 0))
-    l = int(total.get("losses", 0))
-    wr = (w / t * 100.0) if t else 0.0
-    exp = (float(total.get("r_sum", 0.0)) / t) if t else 0.0
-
-    setups = []
-    for k, b in state["perf"].get("by_setup", {}).items():
-        tt = int(b.get("trades", 0))
-        if tt >= 8:
-            setups.append({"key": k, "trades": tt, "wr": round(winrate(b), 2), "expR": round(float(b.get("r_sum", 0.0))/tt, 3)})
-    setups.sort(key=lambda x: (x["wr"], x["trades"]), reverse=True)
-
-    html = f"""
-    <html><head><meta charset="utf-8"><title>{BOT_NAME} Dashboard</title></head>
-    <body style="font-family:Arial; padding:18px;">
-    <h2>{BOT_NAME} — Dashboard</h2>
-    <p><b>Trades:</b> {t} | <b>Wins:</b> {w} | <b>Losses:</b> {l} | <b>Winrate:</b> {round(wr,2)}% | <b>Expectancy(R):</b> {round(exp,3)}</p>
-    <p><b>Report every:</b> {REPORT_EVERY_MIN} min</p>
-    <p><b>Active assets:</b> {", ".join(state["active"].keys()) if state["active"] else "None"}</p>
-
-    <hr/>
-    <h3>Last Prices</h3>
-    <pre>{json.dumps(state.get("last_price", {}), ensure_ascii=False, indent=2)}</pre>
-
-    <h3>Top Setups (min 8 trades)</h3>
-    <pre>{json.dumps(setups[:10], ensure_ascii=False, indent=2)}</pre>
-
-    <h3>Active Trades</h3>
-    <pre>{json.dumps(state.get("active", {}), ensure_ascii=False, indent=2)}</pre>
-
-    <h3>History (last 25)</h3>
-    <pre>{json.dumps(state.get("history", [])[-25:], ensure_ascii=False, indent=2)}</pre>
-    </body></html>
-    """
-    return html
-
-# ---- Admin ----
 @app.post("/admin/ping")
 async def admin_ping(p: AdminSecret):
     require_secret(p.secret, ADMIN_SECRET)
@@ -394,7 +293,6 @@ async def admin_report_now(p: AdminSecret):
     sent = await tg_send(msg_report())
     return {"ok": True, "telegram": "sent" if sent else "not_configured"}
 
-# ---- TradingView webhook ----
 @app.post("/tv")
 async def tv(p: TVPayload):
     require_secret(p.secret, WEBHOOK_SECRET)
@@ -403,24 +301,21 @@ async def tv(p: TVPayload):
     if asset not in ALLOWED_ASSETS:
         raise HTTPException(status_code=400, detail=f"Asset not allowed: {asset}")
 
-    p.asset = asset
-    p.direction = norm_dir(p.direction)
-    p.setup = (p.setup or "CORE").strip().upper()
-    p.session = (p.session or "ALL").strip()
-
-    # DEDUPE key
     ev = (p.event or "").strip().upper()
     r = (p.result or "").strip().upper() if p.result else ""
     dkey = f"{asset}|{ev}|{p.trade_id}|{r}"
     if dedupe_hit(dkey):
         return {"ok": True, "ignored": True, "reason": "duplicate_event"}
 
-    # Update last known price (from script)
+    p.asset = asset
+    p.direction = norm_dir(p.direction)
+    p.setup = (p.setup or "CORE").strip().upper()
+    p.session = (p.session or "ALL").strip()
+
     if p.price is not None:
         state.setdefault("last_price", {})[asset] = {"price": float(p.price), "ts": utc_now_iso()}
         save_state()
 
-    # ENTRY
     if ev == "ENTRY":
         if int(p.confidence) < MIN_CONFIDENCE:
             hist({"ts": utc_now_iso(), "type": "ENTRY_SKIP", "asset": asset, "reason": "low_confidence", "c": p.confidence})
@@ -453,7 +348,6 @@ async def tv(p: TVPayload):
         sent = await tg_send(msg_entry(p))
         return {"ok": True, "status": "active_set", "asset": asset, "telegram": sent}
 
-    # RESOLVE
     if ev == "RESOLVE":
         active = state["active"].get(asset)
         if not active:
@@ -473,7 +367,7 @@ async def tv(p: TVPayload):
         hist({"ts": utc_now_iso(), "type": "RESOLVE", "asset": asset, "trade_id": p.trade_id, "result": result, "setup": setup, "day": today_utc()})
         save_state()
 
-        sent = await tg_send(msg_resolve(p, result, setup))
+        sent = await tg_send(msg_resolve(asset, p.trade_id, result, setup))
         return {"ok": True, "status": "closed", "asset": asset, "result": result, "telegram": sent}
 
     hist({"ts": utc_now_iso(), "type": "UNKNOWN_EVENT", "asset": asset, "event": ev})
