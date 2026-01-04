@@ -1,434 +1,259 @@
-import os
-import json
-from datetime import datetime, timezone, date
-from typing import Optional, Dict, Any
+//@version=5
+indicator("OBSIDIAN PRIME v4B • Balanced Scalping", overlay=true, max_labels_count=500)
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, AliasChoices, ConfigDict
-import httpx
+// =====================
+// Inputs (Balanced Preset)
+// =====================
+secret   = input.string("8f2c9b1a-ChangeMe", "Webhook Secret")
+exchange = input.string("OANDA", "Exchange Tag")
 
-# =========================
-# ENV
-# =========================
-BOT_NAME = os.getenv("BOT_NAME", "🜂 OBSIDIAN GOLD PRIME").strip()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+minScore = input.int(72, "Min Score (Balanced)", minval=0, maxval=100)
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
+useNewsBlock = input.bool(true, "News Block (manual window)")
+newsSess     = input.session("1230-1330", "News Block Window")
+newsBlocked  = useNewsBlock and not na(time(timeframe.period, newsSess))
 
-STATE_PATH = os.getenv("STATE_PATH", "/tmp/obsidian_state.json")
+// Metals session filter
+useSessionMetals = input.bool(true, "Session Filter (Metals)")
+sessMetals       = input.session("0800-1700", "London+NY (chart time)")
+sessOK_metals    = not useSessionMetals or not na(time(timeframe.period, sessMetals))
 
-ALLOWED_ASSETS = {"XAUUSD", "XAGUSD", "BTCUSD", "BTCUSDT"}
+// Cooldowns (minutes) - Balanced
+coolWinMin  = input.int(5,  "Cooldown after WIN (min)", minval=0, maxval=240)
+coolLossMin = input.int(12, "Cooldown after LOSS (min)", minval=0, maxval=240)
 
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "85"))
-# trade rules are enforced in Pine to avoid desync; here we keep only basic safety.
+// Risk controls - Balanced
+maxTradesPerSession = input.int(5, "Max Trades per Session", minval=1, maxval=30)
+maxConsecLosses     = input.int(3, "Max Consecutive Losses", minval=1, maxval=8)
 
-# =========================
-# UTILS
-# =========================
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+// Chop filter - Balanced
+useChopFilter = input.bool(true, "Chop Filter")
+atrLen        = input.int(14, "ATR Length", minval=5, maxval=50)
+atrMinMult    = input.float(0.50, "ATR >= x * ATR(200) avg", minval=0.1, maxval=3.0)
 
-def today_utc() -> str:
-    return date.today().isoformat()
+// =====================
+// Symbol routing
+// =====================
+t = str.upper(syminfo.ticker)
+isXAU = str.contains(t, "XAU")
+isXAG = str.contains(t, "XAG")
+isBTC = str.contains(t, "BTC")
+allowed = isXAU or isXAG or isBTC
 
-def norm_asset(a: str) -> str:
-    return (a or "").strip().upper()
+sessOK = isBTC ? true : sessOK_metals
 
-def norm_dir(d: str) -> str:
-    x = (d or "").strip().upper()
-    if x == "LONG":
-        return "BUY"
-    if x == "SHORT":
-        return "SELL"
-    return x
+// =====================
+// HTF Bias (15m)
+// =====================
+tfHTF = "15"
+ema20 = request.security(syminfo.tickerid, tfHTF, ta.ema(close, 20), barmerge.gaps_off, barmerge.lookahead_off)
+ema50 = request.security(syminfo.tickerid, tfHTF, ta.ema(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+biasBull = ema20 > ema50
+biasText = biasBull ? "Bullish" : "Bearish"
 
-def fmt_price(x: Optional[float]) -> str:
-    if x is None:
-        return "N/A"
-    return f"{x:.5f}".rstrip("0").rstrip(".")
+// =====================
+// SMC / ICT: Liquidity sweep + PD
+// =====================
+len = 3
+ph = ta.pivothigh(high, len, len)
+pl = ta.pivotlow(low,  len, len)
 
-async def tg_send(text: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(url, json=payload)
-            return r.status_code == 200
-    except Exception:
-        return False
+var float lastHigh = na
+var float lastLow  = na
+if not na(ph)
+    lastHigh := ph
+if not na(pl)
+    lastLow := pl
 
-def require_secret(given: str, expected: str) -> None:
-    if not expected:
-        raise HTTPException(status_code=500, detail="Server secret not set")
-    if (given or "").strip() != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+haveRange = not na(lastHigh) and not na(lastLow)
+mid = haveRange ? (lastHigh + lastLow) / 2 : na
 
-# =========================
-# STATE
-# =========================
-def blank_stats() -> Dict[str, float]:
-    return {"trades": 0.0, "wins": 0.0, "losses": 0.0, "r_sum": 0.0}
+inDiscount = haveRange and close < mid
+inPremium  = haveRange and close > mid
 
-state: Dict[str, Any] = {
-    "active": {},   # asset -> trade dict
-    "history": [],  # last events
-    "perf": {
-        "total": blank_stats(),
-        "by_asset": {},
-        "by_setup": {},  # key = "<asset>|<setup>"
-        "daily": {}
-    }
-}
+// Sweep (stop-hunt)
+liqBuy  = haveRange and low  < lastLow  and close > lastLow
+liqSell = haveRange and high > lastHigh and close < lastHigh
 
-def load_state() -> None:
-    global state
-    try:
-        if os.path.exists(STATE_PATH):
-            with open(STATE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and "active" in data and "perf" in data and "history" in data:
-                state = data
-    except Exception:
-        pass
+// =====================
+// Intent / displacement + microtrend
+// =====================
+atr = ta.atr(atrLen)
+disp = math.abs(close - open)
+displacement = atr > 0 and disp > (0.75 * atr)   // slightly easier than v4
 
-def save_state() -> None:
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+ema9  = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+microBull = ema9 > ema21
+microBear = ema9 < ema21
 
-def hist(e: Dict[str, Any]) -> None:
-    state["history"].append(e)
-    if len(state["history"]) > 600:
-        state["history"] = state["history"][-600:]
-    save_state()
+// Chop filter (relaxed)
+atrSlow = ta.sma(ta.atr(200), 200)
+chopOK = not useChopFilter or (atrSlow > 0 and atr >= atrMinMult * atrSlow)
 
-def ensure_bucket(root: Dict[str, Any], key: str) -> Dict[str, float]:
-    if key not in root or not isinstance(root[key], dict):
-        root[key] = blank_stats()
-    for k in ("trades", "wins", "losses", "r_sum"):
-        root[key].setdefault(k, 0.0)
-    return root[key]
+// =====================
+// “Balanced MSS” (Relaxed)
+// Instead of requiring hard break, accept: sweep + (displacement OR microtrend)
+// =====================
+mssBuyRelax  = liqBuy  and (displacement or microBull)
+mssSellRelax = liqSell and (displacement or microBear)
 
-def record_result(asset: str, setup: str, result: str) -> None:
-    """
-    result: "TP1" => WIN, "SL" => LOSS
-    R: TP1=+1, SL=-1 (scalping: we count TP1 as institutional win)
-    """
-    res = (result or "").upper()
-    is_win = res == "TP1"
-    is_loss = res == "SL"
-    r = 1.0 if is_win else (-1.0 if is_loss else 0.0)
+// =====================
+// Setup classification (for learning)
+// =====================
+setup = "CORE"
+setup := (displacement and (inDiscount or inPremium)) ? "IMPULSE" : setup
+setup := (microBull or microBear) ? setup : "CORE"
 
-    total = state["perf"]["total"]
-    total["trades"] += 1
-    total["r_sum"] += r
-    if is_win: total["wins"] += 1
-    if is_loss: total["losses"] += 1
+// =====================
+// Score (0-100) Balanced
+// =====================
+score = 0
+score += allowed ? 20 : 0
+score += (not newsBlocked) ? 10 : 0
+score += sessOK ? 12 : 0
+score += chopOK ? 8 : 0
+score += (liqBuy or liqSell) ? 18 : 0
+score += (mssBuyRelax or mssSellRelax) ? 18 : 0
+score += (inDiscount or inPremium) ? 8 : 0
+score += displacement ? 10 : 0
+score += (microBull or microBear) ? 6 : 0
+score := math.min(score, 100)
 
-    b_asset = ensure_bucket(state["perf"]["by_asset"], asset)
-    b_asset["trades"] += 1
-    b_asset["r_sum"] += r
-    if is_win: b_asset["wins"] += 1
-    if is_loss: b_asset["losses"] += 1
+// =====================
+// Targets per asset
+// =====================
+tp1Move = isXAU ? 4.5 : isXAG ? 0.45 : math.max(70.0, 0.35 * atr)
+tp2Move = isXAU ? 8.0 : isXAG ? 0.80 : math.max(140.0, 0.70 * atr)
+tp3Move = isXAU ? 12.0: isXAG ? 1.20 : math.max(240.0, 1.10 * atr)
 
-    setup_key = f"{asset}|{setup}"
-    b_setup = ensure_bucket(state["perf"]["by_setup"], setup_key)
-    b_setup["trades"] += 1
-    b_setup["r_sum"] += r
-    if is_win: b_setup["wins"] += 1
-    if is_loss: b_setup["losses"] += 1
+slPadTicks = 10.0
 
-    day = today_utc()
-    b_day = ensure_bucket(state["perf"]["daily"], day)
-    b_day["trades"] += 1
-    b_day["r_sum"] += r
-    if is_win: b_day["wins"] += 1
-    if is_loss: b_day["losses"] += 1
+// =====================
+// Lifecycle
+// =====================
+var bool inTrade = false
+var string tradeId = ""
+var string dir = ""
+var float entry = na
+var float sl = na
+var float tp1 = na
+var float tp2 = na
+var float tp3 = na
 
-def winrate(bucket: Dict[str, float]) -> float:
-    t = bucket.get("trades", 0.0)
-    if t <= 0:
-        return 0.0
-    return (bucket.get("wins", 0.0) / t) * 100.0
+var int consecLosses = 0
+var int tradesThisSession = 0
+var int cooldownUntil = 0  // unix ms
 
-# =========================
-# MODELS (long + short keys)
-# =========================
-class AdminSecret(BaseModel):
-    secret: str
+// daily reset
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    tradesThisSession := 0
+    consecLosses := 0
 
-class AdminNotify(BaseModel):
-    secret: str
-    text: str
+// metals session reset
+if not isBTC and useSessionMetals and not sessOK
+    tradesThisSession := 0
 
-class TVPayload(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+nowMs = time
+cooldownActive = nowMs < cooldownUntil
+riskStop = consecLosses >= maxConsecLosses
+tradeLimitHit = tradesThisSession >= maxTradesPerSession
 
-    secret: str = Field(validation_alias=AliasChoices("secret", "s"))
-    event: str = Field(validation_alias=AliasChoices("event", "e"))
-    trade_id: str = Field(validation_alias=AliasChoices("trade_id", "id"))
+// =====================
+// Entry (direction locked to 15m bias)
+// =====================
+gate = allowed and sessOK and (not newsBlocked) and chopOK and (not cooldownActive) and (not riskStop) and (not tradeLimitHit) and (score >= minScore)
 
-    asset: str = Field(validation_alias=AliasChoices("asset", "a"))
-    exchange: str = Field(validation_alias=AliasChoices("exchange", "x"))
-    direction: str = Field(validation_alias=AliasChoices("direction", "d"))
+longCond  = gate and biasBull and mssBuyRelax  and inDiscount and microBull
+shortCond = gate and (not biasBull) and mssSellRelax and inPremium and microBear
 
-    entry: float = Field(validation_alias=AliasChoices("entry", "en"))
-    sl: float = Field(validation_alias=AliasChoices("sl", "sl"))
-    tp1: float = Field(validation_alias=AliasChoices("tp1", "t1"))
-    tp2: float = Field(validation_alias=AliasChoices("tp2", "t2"))
-    tp3: float = Field(validation_alias=AliasChoices("tp3", "t3"))
+newId() => str.tostring(time)
 
-    bias_15m: str = Field(validation_alias=AliasChoices("bias_15m", "b"))
-    confidence: int = Field(validation_alias=AliasChoices("confidence", "c"))
-    session: str = Field(validation_alias=AliasChoices("session", "se"))
+// =====================
+// ENTRY
+// =====================
+if not inTrade and barstate.isconfirmed
+    if longCond
+        inTrade := true
+        tradeId := newId()
+        dir := "BUY"
+        entry := close
+        sl := low - syminfo.mintick * slPadTicks
+        tp1 := entry + tp1Move
+        tp2 := entry + tp2Move
+        tp3 := entry + tp3Move
 
-    result: Optional[str] = Field(default=None, validation_alias=AliasChoices("result", "r"))
-    # Learning fields
-    setup: str = Field(default="CORE", validation_alias=AliasChoices("setup", "st"))
-    score: int = Field(default=0, validation_alias=AliasChoices("score", "sc"))
-    why: Optional[str] = Field(default=None, validation_alias=AliasChoices("why", "why"))
+        alert(
+         '{"s":"' + secret + '","e":"ENTRY","id":"' + tradeId +
+         '","a":"' + syminfo.ticker + '","x":"' + exchange +
+         '","d":"BUY","en":' + str.tostring(entry) +
+         ',"sl":' + str.tostring(sl) +
+         ',"t1":' + str.tostring(tp1) +
+         ',"t2":' + str.tostring(tp2) +
+         ',"t3":' + str.tostring(tp3) +
+         ',"b":"' + biasText + '"' +
+         ',"se":"' + (isBTC ? "CRYPTO" : "London+NY") + '"' +
+         ',"st":"' + setup + '","sc":' + str.tostring(score) + ',"c":' + str.tostring(score) + '}',
+         alert.freq_once_per_bar_close)
 
-# =========================
-# APP
-# =========================
-app = FastAPI(title="OBSIDIAN PRIME", version="4.0.0")
-load_state()
-print(f"{utc_now_iso()} | INFO | BOOT OK | bot={BOT_NAME} | active_assets={len(state.get('active', {}))}")
+        tradesThisSession += 1
 
-# =========================
-# FORMATTERS
-# =========================
-def msg_entry(p: TVPayload) -> str:
-    # “Professional” format: no lot sizing, only price levels + intel + score/setup
-    setup_key = f"{p.asset}|{p.setup}"
-    b = state["perf"]["by_setup"].get(setup_key, blank_stats())
-    wr = winrate(b)
-    t = int(b.get("trades", 0))
+    else if shortCond
+        inTrade := true
+        tradeId := newId()
+        dir := "SELL"
+        entry := close
+        sl := high + syminfo.mintick * slPadTicks
+        tp1 := entry - tp1Move
+        tp2 := entry - tp2Move
+        tp3 := entry - tp3Move
 
-    return (
-        f"{BOT_NAME}\n"
-        f"🟢 ENTRY\n"
-        f"Asset: {p.asset}  ({p.exchange})\n"
-        f"Dir: {norm_dir(p.direction)}\n"
-        f"Entry: {fmt_price(p.entry)}\n"
-        f"SL: {fmt_price(p.sl)}\n"
-        f"TP1: {fmt_price(p.tp1)}\n"
-        f"TP2: {fmt_price(p.tp2)}\n"
-        f"TP3: {fmt_price(p.tp3)}\n"
-        f"Bias 15m: {p.bias_15m}\n"
-        f"Session: {p.session}\n"
-        f"Confidence: {p.confidence} | Score: {p.score}\n"
-        f"Setup: {p.setup} | Setup WR: {wr:.1f}% ({t})\n"
-        f"ID: {p.trade_id}\n"
-        f"{utc_now_iso()}"
-    )
+        alert(
+         '{"s":"' + secret + '","e":"ENTRY","id":"' + tradeId +
+         '","a":"' + syminfo.ticker + '","x":"' + exchange +
+         '","d":"SELL","en":' + str.tostring(entry) +
+         ',"sl":' + str.tostring(sl) +
+         ',"t1":' + str.tostring(tp1) +
+         ',"t2":' + str.tostring(tp2) +
+         ',"t3":' + str.tostring(tp3) +
+         ',"b":"' + biasText + '"' +
+         ',"se":"' + (isBTC ? "CRYPTO" : "London+NY") + '"' +
+         ',"st":"' + setup + '","sc":' + str.tostring(score) + ',"c":' + str.tostring(score) + '}',
+         alert.freq_once_per_bar_close)
 
-def msg_resolve(p: TVPayload, result: str) -> str:
-    res = (result or "RESOLVED").upper()
-    tag = "✅ WIN (TP1)" if res == "TP1" else "❌ LOSS (SL)" if res == "SL" else f"ℹ️ {res}"
-    return (
-        f"{BOT_NAME}\n"
-        f"🏁 RESOLVE\n"
-        f"Asset: {p.asset}\n"
-        f"Result: {tag}\n"
-        f"Setup: {p.setup}\n"
-        f"ID: {p.trade_id}\n"
-        f"{utc_now_iso()}"
-    )
+        tradesThisSession += 1
 
-def msg_skip(p: TVPayload) -> str:
-    why = p.why or "filtered"
-    return (
-        f"{BOT_NAME}\n"
-        f"⏸️ NO TRADE\n"
-        f"Asset: {p.asset}\n"
-        f"Why: {why}\n"
-        f"Bias 15m: {p.bias_15m} | Conf: {p.confidence} | Score: {p.score}\n"
-        f"Session: {p.session}\n"
-        f"{utc_now_iso()}"
-    )
+// =====================
+// RESOLVE (TP1 or SL)
+// =====================
+if inTrade
+    hitSL  = dir == "BUY"  ? low <= sl   : high >= sl
+    hitTP1 = dir == "BUY"  ? high >= tp1 : low  <= tp1
 
-# =========================
-# ROUTES
-# =========================
-@app.get("/health")
-def health():
-    return {"ok": True, "bot": BOT_NAME}
+    if hitSL and barstate.isconfirmed
+        consecLosses += 1
+        cooldownUntil := nowMs + coolLossMin * 60 * 1000
 
-@app.get("/metrics")
-def metrics():
-    total = state["perf"]["total"]
-    t = int(total.get("trades", 0))
-    w = int(total.get("wins", 0))
-    l = int(total.get("losses", 0))
-    wr = (w / t * 100.0) if t else 0.0
-    rsum = float(total.get("r_sum", 0.0))
-    exp = (rsum / t) if t else 0.0
-    return {
-        "ok": True,
-        "trades": t,
-        "wins": w,
-        "losses": l,
-        "winrate_pct": round(wr, 2),
-        "expectancy_R": round(exp, 3),
-        "active_assets": list(state["active"].keys()),
-    }
+        alert('{"s":"' + secret + '","e":"RESOLVE","id":"' + tradeId +
+              '","a":"' + syminfo.ticker + '","r":"SL","st":"' + setup + '","sc":' + str.tostring(score) + '}',
+              alert.freq_once_per_bar_close)
 
-@app.get("/setups")
-def setups():
-    # return top/bottom setups by winrate (min trades >= 8)
-    items = []
-    for k, b in state["perf"]["by_setup"].items():
-        t = int(b.get("trades", 0))
-        if t < 8:
-            continue
-        items.append({
-            "key": k,
-            "trades": t,
-            "winrate_pct": round(winrate(b), 2),
-            "expectancy_R": round(float(b.get("r_sum", 0.0)) / t, 3)
-        })
-    items.sort(key=lambda x: (x["winrate_pct"], x["trades"]), reverse=True)
-    top = items[:10]
-    bottom = list(reversed(items[-10:])) if len(items) >= 10 else []
-    return {"ok": True, "top": top, "bottom": bottom}
+        inTrade := false
 
-@app.get("/dashboard")
-def dashboard():
-    m = metrics()
-    # simple HTML
-    top = setups()["top"]
-    bottom = setups()["bottom"]
-    html = f"""
-    <html><head><meta charset="utf-8"><title>{BOT_NAME} Dashboard</title></head>
-    <body style="font-family:Arial; padding:18px;">
-      <h2>{BOT_NAME} — Dashboard</h2>
-      <p><b>Trades:</b> {m['trades']} | <b>Wins:</b> {m['wins']} | <b>Losses:</b> {m['losses']} | <b>Winrate:</b> {m['winrate_pct']}% | <b>Expectancy(R):</b> {m['expectancy_R']}</p>
-      <p><b>Active assets:</b> {", ".join(m["active_assets"]) if m["active_assets"] else "None"}</p>
-      <hr/>
-      <h3>Top Setups (min 8 trades)</h3>
-      <pre>{json.dumps(top, ensure_ascii=False, indent=2)}</pre>
-      <h3>Bottom Setups (min 8 trades)</h3>
-      <pre>{json.dumps(bottom, ensure_ascii=False, indent=2)}</pre>
-      <hr/>
-      <h3>Active trades</h3>
-      <pre>{json.dumps(state["active"], ensure_ascii=False, indent=2)}</pre>
-      <hr/>
-      <h3>History (last 25)</h3>
-      <pre>{json.dumps(state["history"][-25:], ensure_ascii=False, indent=2)}</pre>
-    </body></html>
-    """
-    return html
+    else if hitTP1 and barstate.isconfirmed
+        consecLosses := 0
+        cooldownUntil := nowMs + coolWinMin * 60 * 1000
 
-# ---- Admin endpoints ----
-@app.post("/admin/ping")
-async def admin_ping(payload: AdminSecret):
-    require_secret(payload.secret, ADMIN_SECRET)
-    sent = await tg_send(f"{BOT_NAME}\n✅ Admin ping OK\n{utc_now_iso()}")
-    return {"ok": True, "telegram": "sent" if sent else "not_configured"}
+        alert('{"s":"' + secret + '","e":"RESOLVE","id":"' + tradeId +
+              '","a":"' + syminfo.ticker + '","r":"TP1","st":"' + setup + '","sc":' + str.tostring(score) + '}',
+              alert.freq_once_per_bar_close)
 
-@app.post("/admin/notify")
-async def admin_notify(payload: AdminNotify):
-    require_secret(payload.secret, ADMIN_SECRET)
-    sent = await tg_send(f"{BOT_NAME}\n📣 Admin message:\n{payload.text}")
-    return {"ok": True, "telegram": "sent" if sent else "not_configured"}
+        inTrade := false
 
-@app.post("/admin/reset")
-async def admin_reset(payload: AdminSecret):
-    require_secret(payload.secret, ADMIN_SECRET)
-    state["active"] = {}
-    state["history"] = []
-    state["perf"] = {"total": blank_stats(), "by_asset": {}, "by_setup": {}, "daily": {}}
-    save_state()
-    sent = await tg_send(f"{BOT_NAME}\n♻️ Reset done\n{utc_now_iso()}")
-    return {"ok": True, "telegram": "sent" if sent else "not_configured"}
-
-# ---- TradingView webhook ----
-@app.post("/tv")
-async def tv_webhook(payload: TVPayload):
-    require_secret(payload.secret, WEBHOOK_SECRET)
-
-    asset = norm_asset(payload.asset)
-    if asset not in ALLOWED_ASSETS:
-        raise HTTPException(status_code=400, detail=f"Asset not allowed: {asset}")
-
-    payload.asset = asset
-    payload.direction = norm_dir(payload.direction)
-    payload.session = (payload.session or "ALL").strip()
-    payload.setup = (payload.setup or "CORE").strip().upper()
-
-    ev = (payload.event or "").strip().upper()
-
-    # Optional safety (keep low risk): ignore very low confidence ENTRY
-    if ev == "ENTRY" and int(payload.confidence) < MIN_CONFIDENCE:
-        hist({"ts": utc_now_iso(), "type": "SKIP", "asset": asset, "why": "confidence_below_min", "conf": payload.confidence})
-        return {"ok": True, "ignored": True, "reason": "confidence_below_min"}
-
-    # SKIP event (from Pine)
-    if ev == "SKIP":
-        hist({"ts": utc_now_iso(), "type": "SKIP", "asset": asset, "why": payload.why, "score": payload.score, "setup": payload.setup, "day": today_utc()})
-        # send skip only if you want (uncomment if you prefer)
-        # await tg_send(msg_skip(payload))
-        return {"ok": True, "status": "skipped"}
-
-    # ENTRY
-    if ev == "ENTRY":
-        if asset in state["active"]:
-            hist({"ts": utc_now_iso(), "type": "ENTRY_IGNORED_ACTIVE", "asset": asset, "incoming": payload.trade_id, "active": state["active"][asset].get("trade_id")})
-            return {"ok": True, "ignored": True, "reason": "active_trade_exists"}
-
-        state["active"][asset] = {
-            "trade_id": payload.trade_id,
-            "asset": asset,
-            "exchange": payload.exchange,
-            "direction": payload.direction,
-            "entry": payload.entry,
-            "sl": payload.sl,
-            "tp1": payload.tp1,
-            "tp2": payload.tp2,
-            "tp3": payload.tp3,
-            "bias_15m": payload.bias_15m,
-            "confidence": int(payload.confidence),
-            "score": int(payload.score),
-            "setup": payload.setup,
-            "session": payload.session,
-            "opened_ts": utc_now_iso(),
-        }
-        hist({"ts": utc_now_iso(), "type": "ENTRY", "asset": asset, "trade_id": payload.trade_id, "setup": payload.setup, "score": payload.score, "day": today_utc()})
-        save_state()
-
-        sent = await tg_send(msg_entry(payload))
-        return {"ok": True, "status": "active_set", "asset": asset, "telegram": sent}
-
-    # RESOLVE
-    if ev == "RESOLVE":
-        active = state["active"].get(asset)
-        if not active:
-            hist({"ts": utc_now_iso(), "type": "RESOLVE_NO_ACTIVE", "asset": asset, "trade_id": payload.trade_id})
-            return {"ok": True, "ignored": True, "reason": "no_active_trade"}
-
-        if str(active.get("trade_id")) != str(payload.trade_id):
-            hist({"ts": utc_now_iso(), "type": "RESOLVE_MISMATCH", "asset": asset, "incoming": payload.trade_id, "active": active.get("trade_id")})
-            return {"ok": True, "ignored": True, "reason": "trade_id_mismatch"}
-
-        result = (payload.result or "RESOLVED").strip().upper()
-        setup = active.get("setup", "CORE")
-        session = active.get("session", "ALL")
-
-        # record learning stats
-        record_result(asset, setup, result)
-
-        state["active"].pop(asset, None)
-        hist({"ts": utc_now_iso(), "type": "RESOLVE", "asset": asset, "trade_id": payload.trade_id, "result": result, "setup": setup, "session": session, "day": today_utc()})
-        save_state()
-
-        sent = await tg_send(msg_resolve(payload, result))
-        return {"ok": True, "status": "closed", "asset": asset, "result": result, "telegram": sent}
-
-    raise HTTPException(status_code=400, detail=f"Unknown event: {ev}")
+// =====================
+// Visuals
+// =====================
+plotshape(longCond,  style=shape.triangleup,   location=location.belowbar, size=size.tiny, text="BUY")
+plotshape(shortCond, style=shape.triangledown, location=location.abovebar, size=size.tiny, text="SELL")
+plotchar(newsBlocked, char="⛔", title="News Block", location=location.top)
