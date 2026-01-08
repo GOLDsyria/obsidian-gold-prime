@@ -1,479 +1,433 @@
-import os, time, random, threading
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
+import os
+import time
+import json
+import random
+import hashlib
+import logging
 import requests
-from fastapi import FastAPI
+import importlib
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+from tradingview_ta import TA_Handler, Interval
 
-# ===================== ENV
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
+# ===================== 🛡️ نظام التخفي ومنع الحظر (Anti-Ban System) 🛡️ =====================
+# إعادة تحميل مكتبة requests لضمان نظافة الجلسة
+importlib.reload(requests)
+
+# قائمة بصمات متصفحات حقيقية لخداع السيرفر
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/120.0.6099.119 Mobile/15E148 Safari/604.1"
+]
+
+# نحتفظ بالدالة الأصلية للطلبات
+_real_post = requests.post
+
+def patched_post(url, **kwargs):
+    """
+    دالة وسيطة تعترض الطلبات:
+    1. إذا كانت لتيليجرام: تمررها فوراً.
+    2. إذا كانت لـ TradingView: تقوم بتغيير الهوية (User-Agent) قبل الإرسال.
+    """
+    # استثناء تيليجرام من التمويه لتجنب المشاكل
+    if "api.telegram.org" in url:
+        return _real_post(url, **kwargs)
+
+    # تمويه الطلب ليبدو وكأنه من متصفح حقيقي
+    headers = kwargs.get('headers', {})
+    headers['User-Agent'] = random.choice(USER_AGENTS)
+    headers['Referer'] = 'https://www.tradingview.com/'
+    headers['Origin'] = 'https://www.tradingview.com'
+    headers['Accept-Language'] = 'en-US,en;q=0.9'
+    
+    kwargs['headers'] = headers
+    
+    # ضمان وجود مهلة زمنية
+    if 'timeout' not in kwargs:
+        kwargs['timeout'] = 15
+
+    return _real_post(url, **kwargs)
+
+# تطبيق التعديل على المكتبة
+requests.post = patched_post
+# =====================================================================================
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+BOT_NAME = os.getenv("BOT_NAME", "الشاهين").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-OANDA_API_KEY    = os.getenv("OANDA_API_KEY", "").strip()
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
-OANDA_ENV        = os.getenv("OANDA_ENV", "practice").strip().lower()
+# الافتراضي: ذهب/فضة من OANDA، نفط من TVC
+ASSETS_JSON = os.getenv(
+    "ASSETS_JSON",
+    json.dumps([
+        {"name":"XAUUSD","screener":"forex","exchange":"OANDA","symbol":"XAUUSD"},
+        {"name":"XAGUSD","screener":"forex","exchange":"OANDA","symbol":"XAGUSD"},
+        {"name":"USOIL","screener":"cfd","exchange":"TVC","symbol":"USOIL"},
+    ])
+)
 
-BOT_NAME         = os.getenv("BOT_NAME", "الشاهين").strip()
-INSTRUMENTS      = [x.strip() for x in os.getenv("INSTRUMENTS", "XAU_USD,XAG_USD,WTICO_USD").split(",") if x.strip()]
-POLL_SEC         = float(os.getenv("POLL_SEC", "10").strip())
+PRIMARY_TF = os.getenv("PRIMARY_TF", "5m")
+CONFIRM_TF = os.getenv("CONFIRM_TF", "15m")
+CONFIRM_REQUIRED = os.getenv("CONFIRM_REQUIRED", "true").lower() == "true"
 
-AGGRESSIVE       = os.getenv("AGGRESSIVE", "1").strip() in ("1", "true", "True", "yes", "YES")
-MIN_SCORE        = int(os.getenv("MIN_SCORE", "55").strip())   # 50-60 balanced
-COOLDOWN_MIN     = int(os.getenv("COOLDOWN_MIN", "10").strip())
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "10"))
+JITTER_SECONDS = float(os.getenv("JITTER_SECONDS", "2.0"))
+MIN_GAP_PER_ASSET_SEC = float(os.getenv("MIN_GAP_PER_ASSET_SEC", "20"))
 
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise SystemExit("Missing TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
-if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-    raise SystemExit("Missing OANDA_API_KEY / OANDA_ACCOUNT_ID")
+MIN_SCORE = float(os.getenv("MIN_SCORE", "58"))
 
-OANDA_BASE = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
+ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.0"))
+RR_TP1 = float(os.getenv("RR_TP1", "0.6"))
+RR_TP2 = float(os.getenv("RR_TP2", "1.0"))
+RR_TP3 = float(os.getenv("RR_TP3", "1.4"))
 
-# ===================== FASTAPI
-app = FastAPI()
+def tv_interval(tf: str):
+    m = {
+        "1m": Interval.INTERVAL_1_MINUTE,
+        "3m": Interval.INTERVAL_3_MINUTES,
+        "5m": Interval.INTERVAL_5_MINUTES,
+        "15m": Interval.INTERVAL_15_MINUTES,
+        "30m": Interval.INTERVAL_30_MINUTES,
+        "1h": Interval.INTERVAL_1_HOUR,
+        "2h": Interval.INTERVAL_2_HOURS,
+        "4h": Interval.INTERVAL_4_HOURS,
+        "1d": Interval.INTERVAL_1_DAY,
+    }
+    return m.get(tf.strip().lower(), Interval.INTERVAL_5_MINUTES)
 
-@app.get("/")
-def root():
-    return {"ok": True, "bot": BOT_NAME, "instruments": INSTRUMENTS, "version": "7.0.0"}
+def must_env(name: str, val: str):
+    if not val:
+        raise RuntimeError(f"Missing env var: {name}")
 
-@app.get("/health")
-def health():
-    return {"ok": True, "status": "healthy", "version": "7.0.0"}
-
-
-# ===================== TELEGRAM
-def tg_send(text: str):
+def tg_send(text: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
+        # نستخدم الدالة الأصلية هنا عبر الـ patch الذي يستثني تيليجرام
         r = requests.post(url, json=payload, timeout=20)
-        if r.status_code != 200:
-            print("Telegram error:", r.status_code, r.text[:200])
+        if r.status_code == 200:
+            return True
+        logging.error("TG send failed: %s %s", r.status_code, r.text[:300])
+        return False
     except Exception as e:
-        print("Telegram exception:", repr(e))
+        logging.exception("TG exception: %s", e)
+        return False
 
-def hawk_msg_start():
-    tg_send(f"🦅 {BOT_NAME} في الأجواء…\nجاهز لصيد الفرص (ذهب/فضة/نفط).")
+def rnd(x: float, n: int = 3) -> str:
+    try:
+        return f"{float(x):.{n}f}"
+    except Exception:
+        return str(x)
 
-def hawk_msg_entry(side: str, sym: str, tf: str, entry: float, sl: float, tp1: float, tp2: float, tp3: float, note: str):
-    emo = "🟢 شراء" if side == "BUY" else "🔴 بيع"
-    tg_send(
-        f"🦅 {BOT_NAME} التقط فريسة!\n"
-        f"{emo}\n"
-        f"الرمز: {sym}\n"
-        f"الإطار: {tf}\n"
-        f"السعر: {fmt(entry)}\n"
-        f"ستوب: {fmt(sl)}\n"
-        f"هدف ١: {fmt(tp1)}\n"
-        f"هدف ٢: {fmt(tp2)}\n"
-        f"هدف ٣: {fmt(tp3)}\n"
-        f"ملاحظة: {note}"
-    )
+def hawk_banner():
+    tg_send(f"{BOT_NAME} في الأجواء (نظام التخفي مفعل 🛡️) 🦅")
 
-def hawk_msg_tp1(side: str, sym: str, price: float):
-    emo = "🟢 شراء" if side == "BUY" else "🔴 بيع"
-    tg_send(f"🦅 {BOT_NAME} التهم الفريسة ✅ (TP1)\n{emo}\n{sym}\nسعر الآن: {fmt(price)}\nمن الآن الصفقة تُعدّ رابحة.")
+def hawk_catch(asset: str, side: str):
+    ar = "شراء" if side == "BUY" else "بيع"
+    return f"🦅 {BOT_NAME} التقط فريسة: {asset} ({ar})"
 
-def hawk_msg_tpN(side: str, sym: str, price: float, n: int):
-    emo = "🟢 شراء" if side == "BUY" else "🔴 بيع"
-    tg_send(f"🦅 متابعة الصيد (TP{n})\n{emo}\n{sym}\nسعر الآن: {fmt(price)}")
+def hawk_eat(asset: str):
+    return f"🦅 {BOT_NAME} التهم الفريسة ✅ ({asset})"
 
-def hawk_msg_sl(side: str, sym: str, price: float):
-    emo = "🟢 شراء" if side == "BUY" else "🔴 بيع"
-    tg_send(f"🦅 الفريسة هربت… سنبحث عن غيرها 🥀\n{emo}\n{sym}\nسعر الآن: {fmt(price)}")
+def hawk_escape(asset: str):
+    return f"🦅 الفريسة هربت… سنبحث عن غيرها ❌ ({asset})"
 
-def hawk_msg_close(side: str, sym: str, price: float, win: bool, reason: str):
-    emo = "🟢 شراء" if side == "BUY" else "🔴 بيع"
-    badge = "🏆 ربح" if win else "🧨 خسارة"
-    tg_send(f"🦅 إغلاق الصفقة: {badge}\n{emo}\n{sym}\nسعر الإغلاق: {fmt(price)}\nسبب: {reason}")
-
-
-# ===================== UTILS
-def fmt(x: float) -> str:
-    return f"{x:.3f}".rstrip("0").rstrip(".")
-
-def jitter_sleep(sec: float):
-    time.sleep(sec + random.uniform(0, 0.35))
-
-def oanda_price_mid(instrument: str) -> float:
-    url = f"{OANDA_BASE}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
-    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
-    params = {"instruments": instrument}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(f"OANDA pricing error {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    p = data["prices"][0]
-    bid = float(p["bids"][0]["price"])
-    ask = float(p["asks"][0]["price"])
-    return (bid + ask) / 2.0
-
-# ===================== CANDLES
 @dataclass
-class Candle:
-    t: int
-    o: float
-    h: float
-    l: float
-    c: float
-
-class BarBuilder:
-    def __init__(self, tf_sec: int):
-        self.tf = tf_sec
-        self.cur: Optional[Candle] = None
-        self.bars: List[Candle] = []
-
-    def _bucket(self, ts: int) -> int:
-        return ts - (ts % self.tf)
-
-    def update(self, ts: int, price: float):
-        b = self._bucket(ts)
-        if self.cur is None:
-            self.cur = Candle(b, price, price, price, price)
-            return
-        if self.cur.t == b:
-            self.cur.h = max(self.cur.h, price)
-            self.cur.l = min(self.cur.l, price)
-            self.cur.c = price
-        else:
-            self.bars.append(self.cur)
-            self.cur = Candle(b, price, price, price, price)
-
-    def series(self, n: int) -> List[Candle]:
-        arr = self.bars[:]
-        if self.cur:
-            arr.append(self.cur)
-        return arr[-n:]
-
-
-# ===================== SMC/ICT ENGINE (Balanced Strong)
-def atr(bars: List[Candle], length: int = 14) -> float:
-    if len(bars) < length + 2:
-        return 0.0
-    trs = []
-    for i in range(1, len(bars)):
-        hi, lo = bars[i].h, bars[i].l
-        pc = bars[i-1].c
-        tr = max(hi - lo, abs(hi - pc), abs(lo - pc))
-        trs.append(tr)
-    w = trs[-length:]
-    return sum(w) / len(w) if w else 0.0
-
-def pivot_high(b: List[Candle], i: int, k: int) -> bool:
-    if i-k < 0 or i+k >= len(b): return False
-    x = b[i].h
-    for j in range(i-k, i+k+1):
-        if j != i and b[j].h >= x: return False
-    return True
-
-def pivot_low(b: List[Candle], i: int, k: int) -> bool:
-    if i-k < 0 or i+k >= len(b): return False
-    x = b[i].l
-    for j in range(i-k, i+k+1):
-        if j != i and b[j].l <= x: return False
-    return True
-
-def last_swings(b: List[Candle], k: int) -> Tuple[Optional[float], Optional[float]]:
-    sh = sl = None
-    for i in range(len(b)-3, 1, -1):  # avoid forming bar
-        if sh is None and pivot_high(b, i, k): sh = b[i].h
-        if sl is None and pivot_low(b, i, k):  sl = b[i].l
-        if sh is not None and sl is not None: break
-    return sh, sl
-
-def liquidity_sweep(b: List[Candle], lookback: int = 20) -> Tuple[bool, bool]:
-    if len(b) < lookback + 3: return False, False
-    last = b[-2]
-    w = b[-(lookback+2):-2]
-    hh = max(x.h for x in w)
-    ll = min(x.l for x in w)
-    sweep_high = (last.h > hh) and (last.c < last.o)  # wick above + bearish close
-    sweep_low  = (last.l < ll) and (last.c > last.o)  # wick below + bullish close
-    return sweep_high, sweep_low
-
-def bos_choch(b: List[Candle], k: int = 3) -> Tuple[bool, bool]:
-    if len(b) < 30: return False, False
-    sh, sl = last_swings(b, k)
-    lc = b[-2].c
-    bos_up = (sh is not None) and (lc > sh)
-    bos_dn = (sl is not None) and (lc < sl)
-    return bos_up, bos_dn
-
-def fvg_ok(b: List[Candle], side: str) -> bool:
-    # FVG بسيط (3 شموع مغلقة) لتأكيد الدفع
-    if len(b) < 5: return True
-    a, c = b[-4], b[-2]
-    if side == "BUY":
-        return c.l > a.h
-    else:
-        return c.h < a.l
-
-def trend_bias_htf(m5: List[Candle], m15: List[Candle]) -> int:
-    # باياس بسيط من هيكل أعلى: BOS على 15 + اتجاه آخر قاع/قمة
-    up15, dn15 = bos_choch(m15, 3)
-    up5, dn5 = bos_choch(m5, 3)
-    if up15 and not dn15: return 1
-    if dn15 and not up15: return -1
-    # fallback: 5m
-    if up5 and not dn5: return 1
-    if dn5 and not up5: return -1
-    return 0
-
-def score_signal(m1: List[Candle], m5: List[Candle], m15: List[Candle]) -> Tuple[int, str, Optional[str]]:
-    # يرجع (score, reason, side)
-    if len(m1) < 80 or len(m5) < 40 or len(m15) < 30:
-        return 0, "Not enough data", None
-
-    sweepH, sweepL = liquidity_sweep(m5, 20)
-    bosU, bosD = bos_choch(m5, 3)
-    bias = trend_bias_htf(m5, m15)
-
-    # نختار side مبدئيًا: sweep أهم من bos
-    side = None
-    if sweepL and not sweepH: side = "BUY"
-    elif sweepH and not sweepL: side = "SELL"
-    elif bosU and not bosD: side = "BUY"
-    elif bosD and not bosU: side = "SELL"
-    else:
-        return 0, "No sweep/BOS", None
-
-    score = 0
-    reasons = []
-
-    # قواعد SMC/ICT
-    if side == "BUY" and sweepL: score += 25; reasons.append("SweepLow")
-    if side == "SELL" and sweepH: score += 25; reasons.append("SweepHigh")
-
-    if side == "BUY" and bosU: score += 20; reasons.append("BOS_UP")
-    if side == "SELL" and bosD: score += 20; reasons.append("BOS_DN")
-
-    # FVG
-    if fvg_ok(m5, side): score += 15; reasons.append("FVG_OK")
-    else:
-        if not AGGRESSIVE:
-            score -= 10; reasons.append("FVG_weak")
-
-    # HTF bias
-    if bias == (1 if side == "BUY" else -1):
-        score += 15; reasons.append("HTF_BIAS")
-    elif bias != 0:
-        score -= (5 if AGGRESSIVE else 15); reasons.append("Against_HTF")
-
-    # مومنتوم بسيط من 1m: جسم آخر شمعة
-    last1 = m1[-2]
-    body = abs(last1.c - last1.o)
-    rng  = max(1e-9, (last1.h - last1.l))
-    body_ratio = body / rng
-    if body_ratio > 0.55:
-        score += 10; reasons.append("Impulse1m")
-
-    # لا نخنق كثير: إذا AGGRESSIVE نسمح أكثر
-    return score, " | ".join(reasons), side
-
-
-# ===================== TRADING STATE
-@dataclass
-class Trade:
-    trade_id: str
-    symbol: str
+class Signal:
     side: str
-    entry: float
+    score: float
+    price: float
     sl: float
     tp1: float
     tp2: float
     tp3: float
-    opened_ts: int
-    tp1_hit: bool = False
-    tp2_hit: bool = False
-    tp3_hit: bool = False
-    closed: bool = False
-    last_notify_ts: int = 0
+    note: str
 
-class Engine:
+class State:
     def __init__(self):
-        self.builders: Dict[str, Dict[str, BarBuilder]] = {}
-        self.trades: Dict[str, Optional[Trade]] = {s: None for s in INSTRUMENTS}
-        self.cooldown_until: Dict[str, int] = {s: 0 for s in INSTRUMENTS}
+        self.last_sent_at: Dict[str, float] = {}
+        self.active: Dict[str, dict] = {}
+        self.win_marked: Dict[str, bool] = {}
+        self.last_msg_hash: Dict[str, str] = {}  # dedup per asset
 
-        for s in INSTRUMENTS:
-            self.builders[s] = {
-                "1m": BarBuilder(60),
-                "5m": BarBuilder(300),
-                "15m": BarBuilder(900),
-            }
+STATE = State()
 
-    def update_price(self, sym: str, ts: int, price: float):
-        self.builders[sym]["1m"].update(ts, price)
-        self.builders[sym]["5m"].update(ts, price)
-        self.builders[sym]["15m"].update(ts, price)
+def can_send(asset: str) -> bool:
+    return (time.time() - STATE.last_sent_at.get(asset, 0.0)) >= MIN_GAP_PER_ASSET_SEC
 
-    def maybe_open(self, sym: str, price: float):
-        # لا تفتح إذا في صفقة مفتوحة أو ضمن cooldown
-        if self.trades[sym] is not None and not self.trades[sym].closed:
-            return
-        if int(time.time()) < self.cooldown_until[sym]:
-            return
+def mark_sent(asset: str):
+    STATE.last_sent_at[asset] = time.time()
 
-        m1 = self.builders[sym]["1m"].series(400)
-        m5 = self.builders[sym]["5m"].series(200)
-        m15= self.builders[sym]["15m"].series(120)
+def dedup_send(asset: str, msg: str) -> bool:
+    h = hashlib.sha256(msg.encode("utf-8")).hexdigest()[:16]
+    if STATE.last_msg_hash.get(asset) == h:
+        return False
+    STATE.last_msg_hash[asset] = h
+    return tg_send(msg)
 
-        score, reason, side = score_signal(m1, m5, m15)
-        if side is None:
-            return
-        if score < MIN_SCORE:
-            return
+def fetch_analysis(screener: str, exchange: str, symbol: str, tf: str):
+    # سيتم استخدام requests.post المعدلة تلقائياً هنا
+    h = TA_Handler(symbol=symbol, exchange=exchange, screener=screener, interval=tv_interval(tf), timeout=20)
+    return h.get_analysis()
 
-        a = atr(m5, 14)
-        if a <= 0:
-            return
+def extract_ind(a) -> Dict[str, float]:
+    ind = dict(a.indicators or {})
+    if "close" not in ind and "Close" in ind:
+        ind["close"] = ind["Close"]
+    return ind
 
-        # Risk model (مناسب للذهب/فضة/نفط): ATR على 5m
-        entry = m5[-2].c  # آخر شمعة 5m مغلقة
-        risk  = a * 1.0
+def summary_score(a) -> float:
+    s = a.summary or {}
+    buy = float(s.get("BUY", 0))
+    sell = float(s.get("SELL", 0))
+    neu = float(s.get("NEUTRAL", 0))
+    total = max(buy + sell + neu, 1.0)
+    bias = (buy - sell) / total
+    return max(0.0, min(100.0, 50.0 + bias * 50.0))
 
-        if side == "BUY":
-            sl = entry - risk
-            tp1 = entry + risk * 0.6
-            tp2 = entry + risk * 1.0
-            tp3 = entry + risk * 1.5
+def side_from_reco(a) -> Optional[str]:
+    reco = ((a.summary or {}).get("RECOMMENDATION", "") or "").upper()
+    if "BUY" in reco and "SELL" not in reco:
+        return "BUY"
+    if "SELL" in reco and "BUY" not in reco:
+        return "SELL"
+    return None
+
+def compute_signal(ind: Dict[str, float]) -> Optional[Tuple[str, float, str]]:
+    close = ind.get("close")
+    ema20 = ind.get("EMA20")
+    ema50 = ind.get("EMA50")
+    rsi = ind.get("RSI")
+    macd = ind.get("MACD.macd")
+    macds = ind.get("MACD.signal")
+    bbp = ind.get("BBP")
+    stoch_k = ind.get("Stoch.K")
+    stoch_d = ind.get("Stoch.D")
+    if close is None or ema20 is None or ema50 is None or rsi is None:
+        return None
+
+    long_bias = ema20 > ema50
+    short_bias = ema20 < ema50
+
+    score = 50.0
+    notes = []
+
+    if long_bias:
+        score += 8; notes.append("TrendUp")
+    if short_bias:
+        score += 8; notes.append("TrendDown")
+
+    # RSI مرن
+    if long_bias and rsi >= 47:
+        score += 7; notes.append("RSI_OK")
+    if short_bias and rsi <= 53:
+        score += 7; notes.append("RSI_OK")
+
+    if macd is not None and macds is not None:
+        if long_bias and macd > macds:
+            score += 9; notes.append("MACD_Bull")
+        if short_bias and macd < macds:
+            score += 9; notes.append("MACD_Bear")
+
+    # Discount/Premium proxy (خفيف)
+    if bbp is not None:
+        if long_bias and bbp < 0.45:
+            score += 9; notes.append("Discount")
+        if short_bias and bbp > 0.55:
+            score += 9; notes.append("Premium")
+
+    if stoch_k is not None and stoch_d is not None:
+        if long_bias and stoch_k < 45 and stoch_k > stoch_d:
+            score += 7; notes.append("StochUp")
+        if short_bias and stoch_k > 55 and stoch_k < stoch_d:
+            score += 7; notes.append("StochDown")
+
+    if long_bias and score >= 55:
+        return ("BUY", min(score, 100.0), " | ".join(notes))
+    if short_bias and score >= 55:
+        return ("SELL", min(score, 100.0), " | ".join(notes))
+    return None
+
+def build_levels(price: float, atr: float, side: str):
+    d = (atr if atr and atr > 0 else price * 0.0013) * ATR_MULT_SL
+    if side == "BUY":
+        sl = price - d
+        tp1 = price + d * RR_TP1
+        tp2 = price + d * RR_TP2
+        tp3 = price + d * RR_TP3
+    else:
+        sl = price + d
+        tp1 = price - d * RR_TP1
+        tp2 = price - d * RR_TP2
+        tp3 = price - d * RR_TP3
+    return sl, tp1, tp2, tp3
+
+def fmt_entry(asset: str, tf: str, sig: Signal) -> str:
+    emoji = "🟢" if sig.side == "BUY" else "🔴"
+    ar = "شراء" if sig.side == "BUY" else "بيع"
+    return (
+        f"🜂 {BOT_NAME}\n"
+        f"{emoji} {ar}\n"
+        f"الرمز: {asset}\n"
+        f"الإطار: {tf}\n"
+        f"السعر: {rnd(sig.price)}\n"
+        f"ستوب: {rnd(sig.sl)}\n"
+        f"هدف ١: {rnd(sig.tp1)}\n"
+        f"هدف ٢: {rnd(sig.tp2)}\n"
+        f"هدف ٣: {rnd(sig.tp3)}\n"
+        f"ملاحظة: ENTRY | Score={rnd(sig.score,1)} | {sig.note}"
+    )
+
+def fmt_update(asset: str, tf: str, side: str, price: float, sl: float, tp1: float, tp2: float, tp3: float, note: str) -> str:
+    emoji = "🟢" if side == "BUY" else "🔴"
+    ar = "شراء" if side == "BUY" else "بيع"
+    return (
+        f"🜂 {BOT_NAME}\n"
+        f"{emoji} {ar}\n"
+        f"الرمز: {asset}\n"
+        f"الإطار: {tf}\n"
+        f"السعر: {rnd(price)}\n"
+        f"ستوب: {rnd(sl)}\n"
+        f"هدف ١: {rnd(tp1)}\n"
+        f"هدف ٢: {rnd(tp2)}\n"
+        f"هدف ٣: {rnd(tp3)}\n"
+        f"ملاحظة: {note}"
+    )
+
+def hit_tp(side: str, price: float, level: float) -> bool:
+    return price >= level if side == "BUY" else price <= level
+
+def hit_sl(side: str, price: float, level: float) -> bool:
+    return price <= level if side == "BUY" else price >= level
+
+def followups(asset: str, tf: str, price: float):
+    tr = STATE.active.get(asset)
+    if not tr:
+        return
+    side = tr["side"]
+    sl = tr["sl"]; tp1 = tr["tp1"]; tp2 = tr["tp2"]; tp3 = tr["tp3"]
+
+    if (not tr["tp1_sent"]) and hit_tp(side, price, tp1):
+        tr["tp1_sent"] = True
+        STATE.win_marked[asset] = True
+        dedup_send(asset, hawk_eat(asset))
+        dedup_send(asset, fmt_update(asset, tf, side, price, sl, tp1, tp2, tp3, "TP1_HIT -> TRADE NOW WIN ✅"))
+        # move SL to BE
+        tr["sl"] = tr["entry"]
+        dedup_send(asset, fmt_update(asset, tf, side, price, tr["sl"], tp1, tp2, tp3, "SL_MOVED_BE"))
+
+    if (not tr["tp2_sent"]) and hit_tp(side, price, tp2):
+        tr["tp2_sent"] = True
+        dedup_send(asset, fmt_update(asset, tf, side, price, tr["sl"], tp1, tp2, tp3, "TP2_HIT"))
+
+    if (not tr["tp3_sent"]) and hit_tp(side, price, tp3):
+        tr["tp3_sent"] = True
+        dedup_send(asset, fmt_update(asset, tf, side, price, tr["sl"], tp1, tp2, tp3, "TP3_HIT"))
+        dedup_send(asset, fmt_update(asset, tf, side, price, tr["sl"], tp1, tp2, tp3, "CLOSE_WIN ✅"))
+        STATE.active.pop(asset, None)
+        return
+
+    if (not tr["sl_sent"]) and hit_sl(side, price, tr["sl"]):
+        tr["sl_sent"] = True
+        if STATE.win_marked.get(asset):
+            dedup_send(asset, fmt_update(asset, tf, side, price, tr["sl"], tp1, tp2, tp3, "CLOSE_WIN (after TP1) ✅"))
         else:
-            sl = entry + risk
-            tp1 = entry - risk * 0.6
-            tp2 = entry - risk * 1.0
-            tp3 = entry - risk * 1.5
+            dedup_send(asset, hawk_escape(asset))
+            dedup_send(asset, fmt_update(asset, tf, side, price, tr["sl"], tp1, tp2, tp3, "CLOSE_LOSS ❌"))
+        STATE.active.pop(asset, None)
 
-        tr = Trade(
-            trade_id=str(m5[-2].t),
-            symbol=sym,
-            side=side,
-            entry=entry,
-            sl=sl,
-            tp1=tp1,
-            tp2=tp2,
-            tp3=tp3,
-            opened_ts=int(time.time())
-        )
-        self.trades[sym] = tr
-        self.cooldown_until[sym] = int(time.time()) + COOLDOWN_MIN * 60
+def main():
+    must_env("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
+    must_env("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
 
-        hawk_msg_entry(side, sym.replace("_",""), "5m", entry, sl, tp1, tp2, tp3, f"SMC/ICT SCORE={score} | {reason}")
+    assets = json.loads(ASSETS_JSON)
+    hawk_banner()
 
-    def track_trade(self, sym: str, price: float):
-        tr = self.trades.get(sym)
-        if tr is None or tr.closed:
-            return
-
-        # منع spam: لا تبعث تحديثات متقاربة جدًا
-        now = int(time.time())
-        if now - tr.last_notify_ts < 3:
-            return
-
-        if tr.side == "BUY":
-            if (not tr.tp1_hit) and price >= tr.tp1:
-                tr.tp1_hit = True
-                tr.last_notify_ts = now
-                hawk_msg_tp1(tr.side, sym.replace("_",""), price)
-
-            if (not tr.tp2_hit) and price >= tr.tp2:
-                tr.tp2_hit = True
-                tr.last_notify_ts = now
-                hawk_msg_tpN(tr.side, sym.replace("_",""), price, 2)
-
-            if (not tr.tp3_hit) and price >= tr.tp3:
-                tr.tp3_hit = True
-                tr.last_notify_ts = now
-                hawk_msg_tpN(tr.side, sym.replace("_",""), price, 3)
-
-            # SL
-            if price <= tr.sl and not tr.closed:
-                tr.closed = True
-                tr.last_notify_ts = now
-                if tr.tp1_hit:
-                    hawk_msg_close(tr.side, sym.replace("_",""), price, True, "SL hit but TP1 already hit => WIN by rule")
-                else:
-                    hawk_msg_sl(tr.side, sym.replace("_",""), price)
-                    hawk_msg_close(tr.side, sym.replace("_",""), price, False, "SL hit before TP1")
-
-            # Close on TP3
-            if tr.tp3_hit and not tr.closed:
-                tr.closed = True
-                tr.last_notify_ts = now
-                hawk_msg_close(tr.side, sym.replace("_",""), price, True, "TP3 hit")
-
-        else:
-            if (not tr.tp1_hit) and price <= tr.tp1:
-                tr.tp1_hit = True
-                tr.last_notify_ts = now
-                hawk_msg_tp1(tr.side, sym.replace("_",""), price)
-
-            if (not tr.tp2_hit) and price <= tr.tp2:
-                tr.tp2_hit = True
-                tr.last_notify_ts = now
-                hawk_msg_tpN(tr.side, sym.replace("_",""), price, 2)
-
-            if (not tr.tp3_hit) and price <= tr.tp3:
-                tr.tp3_hit = True
-                tr.last_notify_ts = now
-                hawk_msg_tpN(tr.side, sym.replace("_",""), price, 3)
-
-            if price >= tr.sl and not tr.closed:
-                tr.closed = True
-                tr.last_notify_ts = now
-                if tr.tp1_hit:
-                    hawk_msg_close(tr.side, sym.replace("_",""), price, True, "SL hit but TP1 already hit => WIN by rule")
-                else:
-                    hawk_msg_sl(tr.side, sym.replace("_",""), price)
-                    hawk_msg_close(tr.side, sym.replace("_",""), price, False, "SL hit before TP1")
-
-            if tr.tp3_hit and not tr.closed:
-                tr.closed = True
-                tr.last_notify_ts = now
-                hawk_msg_close(tr.side, sym.replace("_",""), price, True, "TP3 hit")
-
-
-engine = Engine()
-
-
-# ===================== BOT LOOP
-def bot_loop():
-    hawk_msg_start()
-
-    last_5m_closed: Dict[str, int] = {s: -1 for s in INSTRUMENTS}
+    cursor = 0
+    backoff = 0.0
 
     while True:
         try:
-            ts = int(time.time())
+            a = assets[cursor % len(assets)]
+            cursor += 1
+            name = a["name"]; screener = a["screener"]; exchange = a["exchange"]; symbol = a["symbol"]
 
-            for sym in INSTRUMENTS:
-                price = oanda_price_mid(sym)
-                engine.update_price(sym, ts, price)
+            an1 = fetch_analysis(screener, exchange, symbol, PRIMARY_TF)
+            if an1 is None:
+                # إذا حدث خطأ ما ولم يرجع التحليل
+                time.sleep(1); continue
 
-                # متابعة الصفقة فورًا كل بول
-                engine.track_trade(sym, price)
+            ind1 = extract_ind(an1)
+            price = ind1.get("close")
+            if price is None:
+                time.sleep(1); continue
+            price = float(price)
 
-                # فتح صفقة فقط عند إغلاق شمعة 5m (حتى لا تتأخر بس تكون مؤكدة)
-                m5 = engine.builders[sym]["5m"].series(5)
-                if len(m5) >= 3:
-                    closed_ts = m5[-2].t
-                    if closed_ts != last_5m_closed[sym]:
-                        last_5m_closed[sym] = closed_ts
-                        engine.maybe_open(sym, price)
+            followups(name, PRIMARY_TF, price)
 
-            jitter_sleep(POLL_SEC)
+            if name in STATE.active:
+                time.sleep(0.2)
+                continue
+
+            base = compute_signal(ind1)
+            if not base:
+                backoff = max(0.0, backoff - 0.25)
+            else:
+                side, smc_score, smc_note = base
+                tvs = summary_score(an1)
+                score = 0.6 * smc_score + 0.4 * tvs
+
+                if CONFIRM_REQUIRED:
+                    an2 = fetch_analysis(screener, exchange, symbol, CONFIRM_TF)
+                    # قد يعود an2 بـ None في حالات الحظر الشديد، يجب التعامل معه
+                    if an2:
+                        side2 = side_from_reco(an2)
+                        if side2 and side2 != side:
+                            score -= 6
+                            smc_note += " | TF15_conflict"
+                        else:
+                            score += 3
+                            smc_note += " | TF15_ok"
+
+                if score >= MIN_SCORE and can_send(name):
+                    atr = float(ind1.get("ATR") or 0.0)
+                    sl, tp1, tp2, tp3 = build_levels(price, atr, side)
+                    sig = Signal(side=side, score=score, price=price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, note=smc_note)
+
+                    dedup_send(name, hawk_catch(name, side))
+                    dedup_send(name, fmt_entry(name, PRIMARY_TF, sig))
+                    mark_sent(name)
+
+                    STATE.active[name] = {
+                        "side": side,
+                        "entry": price,
+                        "sl": sl,
+                        "tp1": tp1,
+                        "tp2": tp2,
+                        "tp3": tp3,
+                        "tp1_sent": False,
+                        "tp2_sent": False,
+                        "tp3_sent": False,
+                        "sl_sent": False,
+                    }
+                    STATE.win_marked[name] = False
+
+            sleep_s = max(0.8, POLL_SECONDS + random.uniform(0, JITTER_SECONDS) + backoff)
+            time.sleep(sleep_s)
 
         except Exception as e:
-            print("BOT_ERR:", repr(e))
-            jitter_sleep(min(max(POLL_SEC * 2, 5), 30))
+            logging.exception("Loop error: %s", e)
+            # عند حدوث خطأ، نزيد فترة الانتظار قليلاً لتجنب الإصرار على الخطأ
+            backoff = min(45.0, backoff * 1.5 + 2.0)
+            time.sleep(5 + backoff)
 
-
-# ===================== START BACKGROUND THREAD
-_started = False
-
-@app.on_event("startup")
-def startup_event():
-    global _started
-    if _started:
-        return
-    _started = True
-    t = threading.Thread(target=bot_loop, daemon=True)
-    t.start()
+if __name__ == "__main__":
+    main()
