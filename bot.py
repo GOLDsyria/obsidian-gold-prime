@@ -127,8 +127,7 @@ def rnd(x: float, n: int = 3) -> str:
     except Exception:
         return str(x)
 
-def hawk_banner():
-    tg_send(f"{BOT_NAME} في الأجواء (نظام التخفي مفعل 🛡️) 🦅")
+# تمت إزالة دالة hawk_banner واستدعائها لمنع الرسائل عند التشغيل
 
 def hawk_catch(asset: str, side: str):
     ar = "شراء" if side == "BUY" else "بيع"
@@ -349,7 +348,8 @@ def main():
     must_env("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
 
     assets = json.loads(ASSETS_JSON)
-    hawk_banner()
+    # تم إيقاف رسالة البداية بناءً على طلبك
+    # hawk_banner()
 
     cursor = 0
     backoff = 0.0
