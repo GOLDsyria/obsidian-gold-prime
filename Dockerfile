@@ -1,12 +1,18 @@
-FROM python:3.12-slim
+# استخدام نسخة بايثون خفيفة وحديثة
+FROM python:3.10-slim
 
+# ضبط إعدادات بايثون لتظهر السجلات (Logs) فوراً
+ENV PYTHONUNBUFFERED=1
+
+# تحديد مجلد العمل داخل السيرفر
 WORKDIR /app
+
+# نسخ ملف المتطلبات وتثبيتها
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+# نسخ كود البوت
+COPY bot.py .
 
-ENV PORT=8000
-EXPOSE 8000
-
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# أمر تشغيل البوت
+CMD ["python", "bot.py"]
