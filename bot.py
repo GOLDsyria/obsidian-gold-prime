@@ -5,9 +5,21 @@ import random
 import logging
 import requests
 import importlib
+import threading
+from flask import Flask
 from datetime import datetime
 from dataclasses import dataclass
 from tradingview_ta import TA_Handler, Interval, Exchange
+
+# ===================== 🏥 FAKE SERVER FOR KOYEB 🏥 =====================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Phantom Sniper (Gold & Silver Edition) is Running."
+
+def run_http_server():
+    app.run(host='0.0.0.0', port=8000)
 
 # ===================== 🛡️ ANTI-BAN SYSTEM 🛡️ =====================
 importlib.reload(requests)
@@ -40,12 +52,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 BOT_NAME = os.getenv("BOT_NAME", "Phantom Sniper 👻")
 
-# الأصول
+# 🔥 تم حصر الأصول في الذهب والفضة فقط 🔥
 ASSETS = [
     {"symbol": "XAUUSD", "screener": "forex", "exchange": "OANDA", "pip": 0.1, "digit": 2},
     {"symbol": "XAGUSD", "screener": "forex", "exchange": "OANDA", "pip": 0.01, "digit": 3},
-    {"symbol": "EURUSD", "screener": "forex", "exchange": "FX_IDC", "pip": 0.0001, "digit": 5},
-    {"symbol": "USOIL", "screener": "cfd", "exchange": "TVC", "pip": 0.01, "digit": 2},
 ]
 
 TF_SCALP = Interval.INTERVAL_5_MINUTES
@@ -68,7 +78,6 @@ class TradeSetup:
 
 class PhantomEngine:
     def __init__(self):
-        # هنا نخزن بيانات الصفقات المفتوحة بالكامل وليس التوقيت فقط
         self.active_trades = {} 
 
     def send_tg(self, msg):
@@ -88,12 +97,10 @@ class PhantomEngine:
                 interval=interval,
                 timeout=10
             )
-            analysis = handler.get_analysis()
-            return analysis
+            return handler.get_analysis()
         except Exception:
             return None
 
-    # --- منطق التحليل (Scanning Logic) ---
     def calculate_score(self, asset, data_scalp, data_trend):
         score = 0
         reasons = []
@@ -133,7 +140,11 @@ class PhantomEngine:
 
     def calculate_targets(self, setup: TradeSetup, asset):
         pip = asset['pip']
-        sl_pips = 35 if asset['symbol'] == "XAUUSD" else (20 if asset['symbol'] == "XAGUSD" else 15)
+        # تخصيص الستوب لكل معدن
+        if asset['symbol'] == "XAUUSD":
+            sl_pips = 35.0
+        else: # XAGUSD
+            sl_pips = 20.0
         
         sl_dist = sl_pips * pip
         tp1_dist = sl_dist * 1.0
@@ -152,18 +163,16 @@ class PhantomEngine:
             setup.tp3 = setup.entry - tp3_dist
         return setup
 
-    # --- منطق المراقبة (Monitoring Logic) ---
     def monitor_trade(self, asset, current_price):
         symbol = asset['symbol']
         trade = self.active_trades[symbol]
         
-        # حساب التغير بالنقاط
         if trade['side'] == "BUY":
             pips = (current_price - trade['entry']) / asset['pip']
         else:
             pips = (trade['entry'] - current_price) / asset['pip']
 
-        # 1. Check SL
+        # Check SL
         sl_hit = (trade['side'] == "BUY" and current_price <= trade['sl']) or \
                  (trade['side'] == "SELL" and current_price >= trade['sl'])
         
@@ -174,7 +183,7 @@ class PhantomEngine:
             del self.active_trades[symbol]
             return
 
-        # 2. Check TP1
+        # Check TP1
         tp1_hit = (trade['side'] == "BUY" and current_price >= trade['tp1']) or \
                   (trade['side'] == "SELL" and current_price <= trade['tp1'])
         
@@ -182,9 +191,9 @@ class PhantomEngine:
             msg = f"✅ <b>TP1 HIT ({symbol})</b>\nPrice: {current_price}\nProfit: +{pips:.1f} pips\n🛡️ SL Moved to Entry (BE)."
             self.send_tg(msg)
             trade['tp1_hit'] = True
-            trade['sl'] = trade['entry'] # تحريك الوقف للدخول (Breakeven)
+            trade['sl'] = trade['entry']
 
-        # 3. Check TP2
+        # Check TP2
         tp2_hit = (trade['side'] == "BUY" and current_price >= trade['tp2']) or \
                   (trade['side'] == "SELL" and current_price <= trade['tp2'])
 
@@ -193,7 +202,7 @@ class PhantomEngine:
             self.send_tg(msg)
             trade['tp2_hit'] = True
 
-        # 4. Check TP3 (Final Target)
+        # Check TP3
         tp3_hit = (trade['side'] == "BUY" and current_price >= trade['tp3']) or \
                   (trade['side'] == "SELL" and current_price <= trade['tp3'])
 
@@ -204,31 +213,29 @@ class PhantomEngine:
             del self.active_trades[symbol]
             return
 
-    # --- المشغل الرئيسي ---
     def run(self):
-        logging.info(f"{BOT_NAME} Manager Started. Monitoring & Scanning...")
+        logging.info(f"{BOT_NAME} Manager Started (Gold & Silver Only)...")
+        t = threading.Thread(target=run_http_server)
+        t.start()
         
         while True:
             for asset in ASSETS:
                 try:
                     symbol = asset['symbol']
                     
-                    # 1. جلب البيانات (مرة واحدة لتوفير الطلبات)
-                    # نحتاج السعر الحالي سواء للمراقبة أو للتحليل
+                    # 1. جلب بيانات السكالبينغ (للسعر الحالي والتحليل)
                     data_scalp = self.get_data(asset, TF_SCALP)
                     if not data_scalp: continue
-                    
                     current_price = data_scalp.indicators['close']
 
-                    # 2. إذا كانت هناك صفقة مفتوحة لهذا الزوج -> راقبها فقط
+                    # 2. إذا كانت هناك صفقة مفتوحة -> راقبها فقط
                     if symbol in self.active_trades:
                         logging.info(f"Monitoring active trade: {symbol} @ {current_price}")
                         self.monitor_trade(asset, current_price)
                         time.sleep(1)
-                        continue # تخطي مرحلة البحث عن صفقة جديدة لهذا الزوج
+                        continue 
 
-                    # 3. إذا لم تكن هناك صفقة -> ابحث عن فرصة جديدة
-                    # نحتاج فريم الترند الآن
+                    # 3. إذا لم توجد صفقة -> ابحث عن فرصة
                     data_trend = self.get_data(asset, TF_TREND)
                     if not data_trend: continue
                     time.sleep(1)
@@ -238,7 +245,6 @@ class PhantomEngine:
                     if setup and setup.score >= MIN_SCORE:
                         setup = self.calculate_targets(setup, asset)
                         
-                        # إرسال التوصية
                         d = asset['digit']
                         msg = (
                             f"🚀 <b>{BOT_NAME} SIGNAL</b>\n"
@@ -253,7 +259,6 @@ class PhantomEngine:
                         self.send_tg(msg)
                         logging.info(f"OPENED TRADE: {symbol}")
                         
-                        # تسجيل بيانات الصفقة للمراقبة
                         self.active_trades[symbol] = {
                             "side": setup.side,
                             "entry": setup.entry,
@@ -269,7 +274,6 @@ class PhantomEngine:
                 except Exception as e:
                     logging.error(f"Loop Error ({asset.get('symbol')}): {e}")
             
-            # انتظار قبل الدورة التالية
             time.sleep(15)
 
 if __name__ == "__main__":
