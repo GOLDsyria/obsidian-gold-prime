@@ -1,5 +1,4 @@
-tradingview-ta==3.3.0
-requests==2.32.3
-numpy
-pandas
-flask
+fastapi
+uvicorn
+requests
+python-dotenv
